@@ -71,7 +71,16 @@ QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4")
 # Text embedding settings
 TEXT_EMBED_MODEL_ID = os.environ.get("TEXT_EMBED_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
 TEXT_EMBED_BATCH_SIZE = int(os.environ.get("TEXT_EMBED_BATCH_SIZE", "64"))
+os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/runpod-volume/huggingface")
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/runpod-volume/huggingface/sentence-transformers")
+os.environ.setdefault("TORCH_HOME", "/runpod-volume/torch")
+os.environ.setdefault("XDG_CACHE_HOME", "/runpod-volume/cache")
 
+Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
+Path(os.environ["SENTENCE_TRANSFORMERS_HOME"]).mkdir(parents=True, exist_ok=True)
+Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
+Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif",
     ".nef", ".cr2", ".arw", ".dng", ".tif", ".tiff"
