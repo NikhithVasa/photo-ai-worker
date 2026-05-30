@@ -21,6 +21,14 @@ COPY requirements.txt /app/requirements.txt
 
 RUN python3 -m pip install --upgrade pip
 RUN python3 -m pip install -r /app/requirements.txt
+RUN python3 - <<'PY'
+from insightface.app import FaceAnalysis
+
+app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+app.prepare(ctx_id=-1, det_size=(640, 640))
+
+print("InsightFace buffalo_l downloaded")
+PY
 
 COPY handler.py /app/handler.py
 
