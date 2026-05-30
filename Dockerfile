@@ -29,7 +29,15 @@ app.prepare(ctx_id=-1, det_size=(640, 640))
 
 print("InsightFace buffalo_l downloaded")
 PY
+ENV HF_HOME=/models/huggingface
+ENV TRANSFORMERS_CACHE=/models/huggingface
+ENV SENTENCE_TRANSFORMERS_HOME=/models/huggingface/sentence-transformers
 
+RUN python3 - <<'PY'
+from sentence_transformers import SentenceTransformer
+SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+print("Downloaded sentence-transformers/all-MiniLM-L6-v2")
+PY
 COPY handler.py /app/handler.py
 
 CMD ["python3", "-u", "/app/handler.py"]
