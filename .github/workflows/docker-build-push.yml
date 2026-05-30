@@ -29,5 +29,5 @@ jobs:
           context: .
           push: true
           tags: |
-            dsfsdfnikhith/photo-ai-worker:v1
+            dsfsdfnikhith/photo-ai-worker:v3
             dsfsdfnikhith/photo-ai-worker:latest
