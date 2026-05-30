@@ -23,3 +23,4 @@ onnxruntime-gpu
 insightface
 faiss-cpu
 scikit-learn
+sentence-transformers
