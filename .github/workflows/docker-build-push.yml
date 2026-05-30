@@ -8,6 +8,7 @@ on:
 
 env:
   IMAGE_NAME: photo-ai-worker
+  DOCKER_USER: dsfsdfnikhith
 
 jobs:
   build-and-push:
@@ -29,5 +30,5 @@ jobs:
           context: .
           push: true
           tags: |
-            dsfsdfnikhith/photo-ai-worker:v4
-            dsfsdfnikhith/photo-ai-worker:latest
+            ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:v${{ github.run_number }}
+            ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
