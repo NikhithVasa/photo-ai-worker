@@ -1,0 +1,26 @@
+{
+  "input": {
+    "album_slug": "Nikhith",
+    "events": [
+      {
+        "name": "ENGAGEMENT",
+        "slug": "ENGAGEMENT",
+        "source_prefix": "albums/Nikhith/events/ENGAGEMENT/originals/"
+      },
+      {
+        "name": "NISCHITRADHAM",
+        "slug": "NISCHITRADHAM",
+        "source_prefix": "albums/Nikhith/events/NISCHITRADHAM/originals/"
+      }
+    ],
+    "steps": {
+      "ingest": true,
+      "compress": true,
+      "face_index": true,
+      "rebuild_people": true,
+      "qwen": true,
+      "embeddings": true,
+      "cleanup_temp": true
+    }
+  }
+}
