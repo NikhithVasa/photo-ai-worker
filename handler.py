@@ -2506,6 +2506,20 @@ def handler(event):
         print("job_id:", job_id, flush=True)
         print("payload:", payload, flush=True)
 
+        if payload.get("debug_clear_qwen_cache"):
+            targets = [
+                "/runpod-volume/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct",
+                "/runpod-volume/huggingface/models--Qwen--Qwen2.5-VL-3B-Instruct",
+                "/models/huggingface/models--Qwen--Qwen2.5-VL-3B-Instruct",
+                "/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct"
+            ]
+            deleted = []
+            for t in targets:
+                if os.path.exists(t):
+                    shutil.rmtree(t, ignore_errors=True)
+                    deleted.append(t)
+            return {"ok": True, "deleted": deleted}
+
         if "album_slug" not in payload:
             raise ValueError("Missing input.album_slug")
 
