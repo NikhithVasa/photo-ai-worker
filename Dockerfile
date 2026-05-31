@@ -38,6 +38,10 @@ from sentence_transformers import SentenceTransformer
 SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 print("Downloaded sentence-transformers/all-MiniLM-L6-v2")
 PY
+
+RUN pip uninstall -y onnxruntime || true
+RUN pip install --no-cache-dir onnxruntime-gpu==1.20.1
+
 COPY handler.py /app/handler.py
 
 CMD ["python3", "-u", "/app/handler.py"]

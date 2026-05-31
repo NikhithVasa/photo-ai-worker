@@ -29,7 +29,8 @@ import runpod
 # ============================================================
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "nikhith-ai-photo-gallery-dev")
-
+import onnxruntime as ort
+print("ONNXRuntime providers:", ort.get_available_providers(), flush=True)
 RDS_HOST = os.environ.get("RDS_HOST")
 RDS_PORT = int(os.environ.get("RDS_PORT", "5432"))
 RDS_DB = os.environ.get("RDS_DB")

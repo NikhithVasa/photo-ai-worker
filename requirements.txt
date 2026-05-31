@@ -24,3 +24,5 @@ insightface
 faiss-cpu
 scikit-learn
 sentence-transformers
+onnxruntime-gpu==1.20.1
+insightface==0.7.3
