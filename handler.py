@@ -29,8 +29,6 @@ import runpod
 # ============================================================
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "nikhith-ai-photo-gallery-dev")
-import onnxruntime as ort
-print("ONNXRuntime providers:", ort.get_available_providers(), flush=True)
 RDS_HOST = os.environ.get("RDS_HOST")
 RDS_PORT = int(os.environ.get("RDS_PORT", "5432"))
 RDS_DB = os.environ.get("RDS_DB")
@@ -852,19 +850,75 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
 # INSIGHTFACE
 # ============================================================
 
+def preload_cuda_libs_for_onnxruntime():
+    """
+    Helps ONNXRuntime load CUDA/cuDNN libraries from pip packages and CUDA image
+    before it falls back to incompatible system libraries.
+    """
+    import os
+    import site
+    import glob
+    import ctypes
+
+    candidate_dirs = []
+
+    for base in site.getsitepackages():
+        candidate_dirs.extend(glob.glob(os.path.join(base, "nvidia", "*", "lib")))
+
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(candidate_dirs + ([existing] if existing else []))
+
+    preload_names = [
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libcudart.so.12",
+        "libcudnn.so.9",
+        "libcudnn_graph.so.9",
+        "libcudnn_ops.so.9",
+        "libcudnn_cnn.so.9",
+        "libnvrtc.so.12",
+    ]
+
+    loaded = []
+    for d in candidate_dirs:
+        for name in preload_names:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                try:
+                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                    loaded.append(path)
+                except Exception as e:
+                    print(f"Could not preload {path}: {e}", flush=True)
+
+    print("CUDA preload dirs:", candidate_dirs, flush=True)
+    print("CUDA preloaded libs:", loaded, flush=True)
+
+
 def load_face_app():
     global _FACE_APP
     if _FACE_APP is not None:
         return _FACE_APP
 
+    preload_cuda_libs_for_onnxruntime()
+
+    import onnxruntime as ort
     from insightface.app import FaceAnalysis
+
+    available = ort.get_available_providers()
+    print("ONNXRuntime providers:", available, flush=True)
+
+    if "CUDAExecutionProvider" not in available:
+        raise RuntimeError(
+            f"CUDAExecutionProvider missing. Available providers={available}. "
+            "Refusing to run InsightFace on CPU because GPU is expected."
+        )
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=0, det_size=FACE_DET_SIZE)
 
     _FACE_APP = app
-    print("InsightFace loaded", flush=True)
+    print("InsightFace loaded on GPU", flush=True)
     return _FACE_APP
 
 
