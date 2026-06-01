@@ -899,8 +899,6 @@ def load_face_app():
     if _FACE_APP is not None:
         return _FACE_APP
 
-    preload_cuda_libs_for_onnxruntime()
-
     import onnxruntime as ort
     from insightface.app import FaceAnalysis
 
@@ -913,7 +911,19 @@ def load_face_app():
             "Refusing to run InsightFace on CPU because GPU is expected."
         )
 
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    providers = [
+        (
+            "CUDAExecutionProvider",
+            {
+                "device_id": 0,
+                "cudnn_conv_algo_search": "HEURISTIC",
+                "do_copy_in_default_stream": "1",
+                "cudnn_conv_use_max_workspace": "0"
+            }
+        ),
+        "CPUExecutionProvider"
+    ]
+
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=0, det_size=FACE_DET_SIZE)
 
