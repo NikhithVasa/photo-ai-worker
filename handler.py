@@ -98,6 +98,19 @@ _QWEN_PROCESSOR = None
 _PROCESS_VISION_INFO = None
 _TEXT_EMBED_MODEL = None
 
+# DB connection pooling/retry settings.
+# This is intentionally tiny because Runpod workers are long-running processes
+# and RDS dev instances can have low max_connections.
+_DB_POOL = None
+_TABLE_COLUMNS_CACHE: Dict[str, set[str]] = {}
+_HAS_TABLE_CACHE: Dict[str, bool] = {}
+
+DB_POOL_MIN_CONN = int(os.environ.get("DB_POOL_MIN_CONN", "1"))
+DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "3"))
+DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "8"))
+DB_CONNECT_BASE_SLEEP = float(os.environ.get("DB_CONNECT_BASE_SLEEP", "0.75"))
+DB_APPLICATION_NAME = os.environ.get("DB_APPLICATION_NAME", "photo_ai_worker")
+
 
 # ============================================================
 # DB HELPERS
@@ -121,16 +134,125 @@ def assert_env_ready() -> None:
         raise RuntimeError(f"Missing required environment variables: {missing}")
 
 
-def get_conn():
+class PooledDbConnection:
+    """
+    Small wrapper so existing code can keep calling conn.close().
+    close() returns the connection to the pool instead of closing the socket.
+    """
+    def __init__(self, pool_obj, conn):
+        self._pool = pool_obj
+        self._conn = conn
+        self._returned = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self._conn.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def close(self):
+        if self._returned:
+            return
+
+        self._returned = True
+
+        try:
+            if self._conn and not self._conn.closed:
+                # Prevent "idle in transaction" when SELECT helpers return to the pool.
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+
+                self._pool.putconn(self._conn)
+        except Exception:
+            try:
+                self._pool.putconn(self._conn, close=True)
+            except Exception:
+                pass
+
+
+def _connect_kwargs() -> Dict[str, Any]:
+    return {
+        "host": RDS_HOST,
+        "port": RDS_PORT,
+        "dbname": RDS_DB,
+        "user": RDS_USER,
+        "password": RDS_PASSWORD,
+        "cursor_factory": RealDictCursor,
+        "application_name": DB_APPLICATION_NAME,
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
+        "keepalives": 1,
+        "keepalives_idle": int(os.environ.get("DB_KEEPALIVES_IDLE", "30")),
+        "keepalives_interval": int(os.environ.get("DB_KEEPALIVES_INTERVAL", "10")),
+        "keepalives_count": int(os.environ.get("DB_KEEPALIVES_COUNT", "3")),
+    }
+
+
+def _init_db_pool():
+    global _DB_POOL
+
+    if _DB_POOL is not None:
+        return _DB_POOL
+
     assert_env_ready()
-    return psycopg2.connect(
-        host=RDS_HOST,
-        port=RDS_PORT,
-        dbname=RDS_DB,
-        user=RDS_USER,
-        password=RDS_PASSWORD,
-        cursor_factory=RealDictCursor,
-    )
+
+    from psycopg2.pool import SimpleConnectionPool
+
+    last_err = None
+    for attempt in range(DB_CONNECT_RETRIES):
+        try:
+            _DB_POOL = SimpleConnectionPool(
+                minconn=DB_POOL_MIN_CONN,
+                maxconn=DB_POOL_MAX_CONN,
+                **_connect_kwargs(),
+            )
+            print(
+                f"DB pool initialized: min={DB_POOL_MIN_CONN}, max={DB_POOL_MAX_CONN}, "
+                f"application_name={DB_APPLICATION_NAME}",
+                flush=True,
+            )
+            return _DB_POOL
+        except psycopg2.OperationalError as e:
+            last_err = e
+            sleep_for = min(20.0, DB_CONNECT_BASE_SLEEP * (2 ** attempt))
+            print(
+                f"DB pool init failed attempt={attempt + 1}/{DB_CONNECT_RETRIES}: {repr(e)}; "
+                f"sleeping {sleep_for:.2f}s",
+                flush=True,
+            )
+            time.sleep(sleep_for)
+
+    raise last_err
+
+
+def get_conn():
+    pool_obj = _init_db_pool()
+
+    last_err = None
+    for attempt in range(DB_CONNECT_RETRIES):
+        try:
+            conn = pool_obj.getconn()
+            if conn.closed:
+                pool_obj.putconn(conn, close=True)
+                raise psycopg2.OperationalError("pooled connection was closed")
+
+            return PooledDbConnection(pool_obj, conn)
+
+        except psycopg2.OperationalError as e:
+            last_err = e
+            sleep_for = min(20.0, DB_CONNECT_BASE_SLEEP * (2 ** attempt))
+            print(
+                f"DB connection failed attempt={attempt + 1}/{DB_CONNECT_RETRIES}: {repr(e)}; "
+                f"sleeping {sleep_for:.2f}s",
+                flush=True,
+            )
+            time.sleep(sleep_for)
+
+    raise last_err
 
 
 def db_one(sql: str, params: Tuple[Any, ...] = ()):
@@ -154,16 +276,27 @@ def db_all(sql: str, params: Tuple[Any, ...] = ()):
 
 
 def table_columns(table_name: str) -> set[str]:
+    cached = _TABLE_COLUMNS_CACHE.get(table_name)
+    if cached is not None:
+        return cached
+
     rows = db_all("""
         SELECT column_name
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = %s;
     """, (table_name,))
-    return {r["column_name"] for r in rows}
+
+    cols = {r["column_name"] for r in rows}
+    _TABLE_COLUMNS_CACHE[table_name] = cols
+    return cols
 
 
 def has_table(table_name: str) -> bool:
+    cached = _HAS_TABLE_CACHE.get(table_name)
+    if cached is not None:
+        return cached
+
     row = db_one("""
         SELECT EXISTS (
             SELECT 1
@@ -172,7 +305,10 @@ def has_table(table_name: str) -> bool:
               AND table_name=%s
         ) AS exists;
     """, (table_name,))
-    return bool(row and row["exists"])
+
+    value = bool(row and row["exists"])
+    _HAS_TABLE_CACHE[table_name] = value
+    return value
 
 
 def execute_sql(sql: str, params: Tuple[Any, ...] = ()) -> None:
@@ -183,6 +319,19 @@ def execute_sql(sql: str, params: Tuple[Any, ...] = ()) -> None:
                 cur.execute(sql, params)
     finally:
         conn.close()
+
+
+def execute_sql_best_effort(sql: str, params: Tuple[Any, ...] = ()) -> bool:
+    """
+    Use this only for error/status updates where failing to write the status should
+    not crash the whole worker.
+    """
+    try:
+        execute_sql(sql, params)
+        return True
+    except Exception as e:
+        print("Best-effort SQL failed:", repr(e), flush=True)
+        return False
 
 
 # ============================================================
@@ -1958,6 +2107,74 @@ def annotate_photo(photo: Dict[str, Any]) -> Tuple[Path, List[Dict[str, Any]]]:
     return make_qwen_image(ann), faces
 
 
+def fetch_qwen_faces_by_photo(photo_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    if not photo_ids:
+        return {}
+
+    rows = db_all("""
+        SELECT f.*, pe.person_number
+        FROM faces f
+        JOIN people pe ON pe.id=f.person_id
+        WHERE f.photo_id = ANY(%s::uuid[])
+          AND f.person_id IS NOT NULL
+        ORDER BY f.photo_id, pe.person_number;
+    """, (photo_ids,))
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["photo_id"]), []).append(row)
+
+    return grouped
+
+
+def fetch_event_map(event_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not event_ids:
+        return {}
+
+    rows = db_all("""
+        SELECT id, name, slug
+        FROM album_events
+        WHERE id = ANY(%s::uuid[]);
+    """, (event_ids,))
+
+    return {
+        str(r["id"]): {"name": r["name"], "slug": r["slug"]}
+        for r in rows
+    }
+
+
+def annotate_photo_with_faces(photo: Dict[str, Any], faces: List[Dict[str, Any]]) -> Tuple[Path, List[Dict[str, Any]]]:
+    if not faces:
+        raise RuntimeError("No labeled faces for photo")
+
+    tmpdir = LOCAL_WORK / "annotated" / str(photo["id"])
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    local = tmpdir / "ai.webp"
+    download_file(photo["ai_input_s3_key"], local)
+
+    img = Image.open(local).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    for f in faces:
+        label = f"Person {f['person_number']}"
+        x1, y1, x2, y2 = int(f["bbox_x1"]), int(f["bbox_y1"]), int(f["bbox_x2"]), int(f["bbox_y2"])
+
+        draw.rectangle((x1, y1, x2, y2), outline=(0, 255, 0), width=4)
+
+        tw = 9 * len(label) + 10
+        label_y1 = max(0, y1 - 24)
+        draw.rectangle((x1, label_y1, x1 + tw, y1), fill=(0, 255, 0))
+        draw.text((x1 + 4, max(0, y1 - 21)), label, fill=(0, 0, 0))
+
+    ann = tmpdir / "annotated.jpg"
+    img.save(ann, "JPEG", quality=86)
+
+    upload_file(ann, photo["annotated_s3_key"], "image/jpeg")
+
+    return make_qwen_image(ann), faces
+
+
 def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
     import torch
 
@@ -2040,16 +2257,26 @@ def get_label_to_id(album_ctx: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-def save_qwen_photo(photo: Dict[str, Any], data: Dict[str, Any], label_to_id: Dict[str, str]) -> None:
+def save_qwen_photo(
+    photo: Dict[str, Any],
+    data: Dict[str, Any],
+    label_to_id: Dict[str, str],
+    event_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
     photo_data = data.get("photo", {})
     people_map = data.get("people_map", {})
 
-    event_row = db_one("""
-        SELECT name, slug
-        FROM album_events
-        WHERE id=%s::uuid
-        LIMIT 1;
-    """, (str(photo["album_event_id"]),))
+    event_row = None
+    if event_by_id:
+        event_row = event_by_id.get(str(photo["album_event_id"]))
+
+    if event_row is None:
+        event_row = db_one("""
+            SELECT name, slug
+            FROM album_events
+            WHERE id=%s::uuid
+            LIMIT 1;
+        """, (str(photo["album_event_id"]),))
 
     if event_row:
         data["event"] = {
@@ -2134,7 +2361,7 @@ def save_qwen_photo(photo: Dict[str, Any], data: Dict[str, Any], label_to_id: Di
 
 
 def mark_qwen_failed(photo: Dict[str, Any], err: Exception) -> None:
-    execute_sql("""
+    execute_sql_best_effort("""
         UPDATE photos
         SET qwen_status='failed',
             qwen_error=%s,
@@ -2176,6 +2403,11 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
         ORDER BY created_at;
     """, (album_id, event_ids))
 
+    # Reduce DB churn during Qwen: fetch all face labels and event data once.
+    photo_ids = [str(r["id"]) for r in rows]
+    faces_by_photo_id = fetch_qwen_faces_by_photo(photo_ids)
+    event_by_id = fetch_event_map(list({str(r["album_event_id"]) for r in rows}))
+
     ok = 0
     fail = 0
     errors = []
@@ -2185,7 +2417,8 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
 
         for photo in batch:
             try:
-                qwen_img, _faces = annotate_photo(photo)
+                faces = faces_by_photo_id.get(str(photo["id"]), [])
+                qwen_img, _faces = annotate_photo_with_faces(photo, faces)
                 prepared.append((photo, qwen_img))
             except Exception as e:
                 fail += 1
@@ -2200,7 +2433,7 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
 
             for (photo, _), data in zip(prepared, datas):
                 try:
-                    save_qwen_photo(photo, data, label_to_id)
+                    save_qwen_photo(photo, data, label_to_id, event_by_id=event_by_id)
                     ok += 1
                 except Exception as e:
                     fail += 1
@@ -2213,7 +2446,7 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
             for photo, qwen_img in prepared:
                 try:
                     data = qwen_describe_batch([qwen_img])[0]
-                    save_qwen_photo(photo, data, label_to_id)
+                    save_qwen_photo(photo, data, label_to_id, event_by_id=event_by_id)
                     ok += 1
                 except Exception as e:
                     fail += 1
@@ -2584,6 +2817,30 @@ def handler(event):
                     shutil.rmtree(t, ignore_errors=True)
                     deleted.append(t)
             return {"ok": True, "deleted": deleted}
+
+        if payload.get("debug_db_connections"):
+            rows = db_all("""
+                SELECT
+                  usename,
+                  application_name,
+                  client_addr::text AS client_addr,
+                  state,
+                  COUNT(*) AS connections
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                GROUP BY usename, application_name, client_addr, state
+                ORDER BY connections DESC;
+            """)
+            max_conn = db_one("SHOW max_connections;")
+            total = db_one("SELECT COUNT(*) AS total_connections FROM pg_stat_activity;")
+            return {
+                "ok": True,
+                "max_connections": max_conn.get("max_connections") if max_conn else None,
+                "total_connections": int(total["total_connections"]) if total else None,
+                "connections": rows,
+                "db_pool_max_conn": DB_POOL_MAX_CONN,
+                "db_application_name": DB_APPLICATION_NAME,
+            }
 
         if "album_slug" not in payload:
             raise ValueError("Missing input.album_slug")
