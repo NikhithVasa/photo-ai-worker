@@ -70,6 +70,13 @@ QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4")
 # Text embedding settings
 TEXT_EMBED_MODEL_ID = os.environ.get("TEXT_EMBED_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
 TEXT_EMBED_BATCH_SIZE = int(os.environ.get("TEXT_EMBED_BATCH_SIZE", "64"))
+
+# Image embedding / AI culling settings
+IMAGE_EMBED_MODEL_ID = os.environ.get("IMAGE_EMBED_MODEL_ID", "openai/clip-vit-base-patch32")
+IMAGE_EMBED_BATCH_SIZE = int(os.environ.get("IMAGE_EMBED_BATCH_SIZE", "16"))
+CULLING_VERSION = os.environ.get("CULLING_VERSION", "v1")
+CLUSTER_VERSION = os.environ.get("CLUSTER_VERSION", "v1")
+
 os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/runpod-volume/huggingface")
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/runpod-volume/huggingface/sentence-transformers")
@@ -97,6 +104,9 @@ _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
 _PROCESS_VISION_INFO = None
 _TEXT_EMBED_MODEL = None
+_IMAGE_EMBED_MODEL = None
+_IMAGE_EMBED_PROCESSOR = None
+
 
 # DB connection pooling/retry settings.
 # This is intentionally tiny because Runpod workers are long-running processes
@@ -1047,6 +1057,8 @@ def load_face_app():
     global _FACE_APP
     if _FACE_APP is not None:
         return _FACE_APP
+
+    preload_cuda_libs_for_onnxruntime()
 
     import onnxruntime as ort
     from insightface.app import FaceAnalysis
@@ -2691,6 +2703,831 @@ def final_verify(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dic
     return result
 
 
+
+# ============================================================
+# AI CULLING / BEST PHOTO SELECTION
+# ============================================================
+
+def restore_album_only(album_slug: str) -> Dict[str, Any]:
+    row = db_one("""
+        SELECT id, slug, name, album_type, culling_enabled, culling_config
+        FROM albums
+        WHERE slug=%s
+          AND COALESCE(is_deleted,false)=false
+        LIMIT 1;
+    """, (album_slug,))
+    if not row:
+        raise ValueError(f"Album not found: {album_slug}")
+    return {
+        "album_id": str(row["id"]),
+        "album_slug": row["slug"],
+        "album_name": row.get("name"),
+        "album_type": row.get("album_type") or "general",
+        "culling_enabled": bool(row.get("culling_enabled")),
+        "culling_config": row.get("culling_config") or {},
+    }
+
+
+def resolve_events_for_album(album_ctx: Dict[str, Any], payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    album_id = album_ctx["album_id"]
+    event_slugs = payload.get("event_slugs") or payload.get("events_slugs")
+    event_slug = payload.get("event_slug")
+    if event_slug and not event_slugs:
+        event_slugs = [event_slug]
+
+    if payload.get("events"):
+        # Existing full pipeline sends source_prefix in events. For culling modes we only need DB event rows.
+        slugs = [e.get("slug") for e in payload.get("events", []) if e.get("slug")]
+        if slugs and not event_slugs:
+            event_slugs = slugs
+
+    if event_slugs:
+        rows = db_all("""
+            SELECT id, name, slug, source_prefix
+            FROM album_events
+            WHERE album_id=%s::uuid
+              AND slug = ANY(%s)
+              AND COALESCE(is_deleted,false)=false
+            ORDER BY sort_order, name;
+        """, (album_id, event_slugs))
+    else:
+        rows = db_all("""
+            SELECT id, name, slug, source_prefix
+            FROM album_events
+            WHERE album_id=%s::uuid
+              AND COALESCE(is_deleted,false)=false
+            ORDER BY sort_order, name;
+        """, (album_id,))
+
+    return [
+        {
+            "event_id": str(r["id"]),
+            "name": r["name"],
+            "slug": r["slug"],
+            "source_prefix": r.get("source_prefix"),
+        }
+        for r in rows
+    ]
+
+
+def get_qwen_quality(qwen_json: Any) -> Dict[str, Any]:
+    if not isinstance(qwen_json, dict):
+        return {}
+    if "quality" in qwen_json and isinstance(qwen_json["quality"], dict):
+        return qwen_json["quality"]
+    raw = qwen_json.get("raw") if isinstance(qwen_json.get("raw"), dict) else qwen_json
+    return {
+        "background_quality": raw.get("background_quality"),
+        "frame_clarity": raw.get("frame_clarity"),
+        "album_worthy_score": raw.get("album_worthy_score"),
+        "camera_gaze_overall": (raw.get("camera_gaze") or {}).get("overall") if isinstance(raw.get("camera_gaze"), dict) else None,
+        "album_worthy_reason": raw.get("album_worthy_reason"),
+    }
+
+
+def score01_from_10(v: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, min(1.0, float(v) / 10.0))
+    except Exception:
+        return default
+
+
+def compute_cv_quality(local_path: Path) -> Dict[str, float]:
+    img = cv2.imread(str(local_path))
+    if img is None:
+        raise RuntimeError(f"cv2 could not read image: {local_path}")
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness = max(0.0, min(1.0, lap_var / 900.0))
+
+    mean = float(gray.mean())
+    # Best exposure is around middle gray. This penalizes very dark/bright frames.
+    exposure = 1.0 - min(abs(mean - 127.0) / 127.0, 1.0)
+
+    std = float(gray.std())
+    contrast = max(0.0, min(1.0, std / 80.0))
+
+    # Cheap noise estimate: residual after small blur. Lower residual is better.
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    residual = float(np.mean(np.abs(gray.astype(np.float32) - blur.astype(np.float32))))
+    noise_score = 1.0 - max(0.0, min(1.0, residual / 18.0))
+
+    return {
+        "sharpness_score": round(sharpness, 4),
+        "exposure_score": round(exposure, 4),
+        "contrast_score": round(contrast, 4),
+        "noise_score": round(noise_score, 4),
+        "motion_blur_score": round(sharpness, 4),
+    }
+
+
+def download_best_available_photo(photo: Dict[str, Any], purpose: str) -> Path:
+    photo_id = str(photo["id"])
+    key = photo.get("ai_input_s3_key") or photo.get("clean_preview_s3_key") or photo.get("original_s3_key") or photo.get("source_s3_key")
+    if not key:
+        raise RuntimeError("Photo has no usable S3 key")
+    tmpdir = LOCAL_WORK / purpose / photo_id
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(key).suffix or ".jpg"
+    local = tmpdir / f"input{suffix}"
+    download_file(key, local)
+    return local
+
+
+def build_similarity_caption(photo: Dict[str, Any], qwen_json: Any) -> Tuple[str, str]:
+    q = qwen_json if isinstance(qwen_json, dict) else {}
+    photo_obj = q.get("photo") if isinstance(q.get("photo"), dict) else {}
+    quality = get_qwen_quality(q)
+    caption = (
+        photo.get("caption")
+        or photo_obj.get("caption")
+        or photo.get("ai_description")
+        or photo_obj.get("detailed_description")
+        or photo.get("search_text")
+        or photo.get("file_name")
+        or "photo"
+    )
+    caption = str(caption)[:700]
+    gaze = str(quality.get("camera_gaze_overall") or "uncertain")
+    pose_key = "general"
+    text = caption.lower()
+    if "sitting" in text or "seated" in text:
+        pose_key = "seated"
+    elif "standing" in text:
+        pose_key = "standing"
+    elif "close" in text or "portrait" in text:
+        pose_key = "portrait"
+    elif "group" in text:
+        pose_key = "group"
+    return f"{caption}; gaze={gaze}; pose={pose_key}", pose_key
+
+
+def upsert_photo_culling_score(photo: Dict[str, Any], payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    photo_id = str(photo["id"])
+    album_type = payload.get("album_type") or photo.get("album_type") or "general"
+    persona_key = payload.get("persona_key") or album_type or "general"
+    scoring_version = payload.get("scoring_version") or CULLING_VERSION
+
+    try:
+        local = download_best_available_photo(photo, "culling-score")
+        cvq = compute_cv_quality(local)
+
+        q = photo.get("qwen_json") if isinstance(photo.get("qwen_json"), dict) else {}
+        quality = get_qwen_quality(q)
+
+        face_row = db_one("""
+            SELECT
+                COUNT(*) AS face_count,
+                AVG(face_quality_score) AS avg_face_quality,
+                MAX(face_quality_score) AS max_face_quality,
+                AVG(detection_confidence) AS avg_detection_confidence
+            FROM faces
+            WHERE photo_id=%s::uuid;
+        """, (photo_id,)) or {}
+
+        face_count = int(face_row.get("face_count") or 0)
+        raw_face_quality = float(face_row.get("max_face_quality") or 0.0)
+        # Your current face_quality_score is det_score * face_side, so normalize loosely.
+        face_quality = max(0.0, min(1.0, raw_face_quality / 500.0))
+
+        qwen_aesthetic = score01_from_10(quality.get("album_worthy_score"), 0.0)
+        composition = score01_from_10(quality.get("background_quality"), 0.5)
+        frame_clarity = score01_from_10(quality.get("frame_clarity"), cvq["sharpness_score"])
+
+        gaze = str(quality.get("camera_gaze_overall") or "uncertain").lower()
+        gaze_score = 1.0 if gaze == "all" else 0.65 if gaze == "some" else 0.35 if gaze == "none" else 0.5
+        eyes_open_score = gaze_score
+        smile_score = 0.5
+        subject_center_score = 0.6 if face_count else 0.4
+        occlusion_penalty = 0.0
+        stranger_penalty = 0.0
+        defect_penalty = 0.0
+        duplicate_penalty = 0.0
+
+        # Persona can be tuned later. For now, wedding/saree reward album-worthy and face/gaze more.
+        if persona_key in {"wedding", "saree", "single_portrait", "baby_photoshoot"}:
+            persona_score = (qwen_aesthetic * 0.45) + (face_quality * 0.25) + (gaze_score * 0.20) + (composition * 0.10)
+        else:
+            persona_score = (qwen_aesthetic * 0.35) + (frame_clarity * 0.25) + (composition * 0.20) + (face_quality * 0.20)
+
+        final_score = (
+            cvq["sharpness_score"] * 0.18
+            + cvq["exposure_score"] * 0.10
+            + cvq["contrast_score"] * 0.07
+            + cvq["noise_score"] * 0.05
+            + face_quality * 0.16
+            + eyes_open_score * 0.10
+            + gaze_score * 0.08
+            + composition * 0.06
+            + qwen_aesthetic * 0.12
+            + persona_score * 0.08
+            - occlusion_penalty
+            - stranger_penalty
+            - defect_penalty
+            - duplicate_penalty
+        )
+        final_score = max(0.0, min(1.0, final_score))
+
+        similarity_caption, pose_key = build_similarity_caption(photo, q)
+        reasons = []
+        if cvq["sharpness_score"] > 0.75:
+            reasons.append("sharp image")
+        if gaze_score >= 0.9:
+            reasons.append("subjects looking at camera")
+        if qwen_aesthetic >= 0.8:
+            reasons.append("high album-worthy AI score")
+        if composition >= 0.75:
+            reasons.append("good background/composition")
+        if not reasons:
+            reasons.append("balanced technical and AI quality score")
+
+        quality_json = {
+            "cv": cvq,
+            "qwen_quality": quality,
+            "face_count": face_count,
+            "raw_face_quality": raw_face_quality,
+            "gaze": gaze,
+        }
+
+        execute_sql("""
+            INSERT INTO photo_culling_scores(
+                photo_id, album_id, album_event_id, album_type, persona_key,
+                sharpness_score, exposure_score, contrast_score, noise_score, motion_blur_score,
+                composition_score, face_quality_score, eyes_open_score, gaze_score, smile_score,
+                subject_center_score, occlusion_penalty, stranger_penalty,
+                qwen_aesthetic_score, persona_score, defect_penalty, duplicate_penalty,
+                final_score, similarity_caption, pose_key, quality_json, reasons,
+                score_status, score_error, scoring_version, created_at, updated_at
+            )
+            VALUES(
+                %s::uuid,%s::uuid,%s::uuid,%s,%s,
+                %s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,
+                %s,%s,%s,
+                %s,%s,%s,%s,
+                %s,%s,%s,%s,%s,
+                'completed',NULL,%s,now(),now()
+            )
+            ON CONFLICT(photo_id, scoring_version, persona_key)
+            DO UPDATE SET
+                album_type=EXCLUDED.album_type,
+                sharpness_score=EXCLUDED.sharpness_score,
+                exposure_score=EXCLUDED.exposure_score,
+                contrast_score=EXCLUDED.contrast_score,
+                noise_score=EXCLUDED.noise_score,
+                motion_blur_score=EXCLUDED.motion_blur_score,
+                composition_score=EXCLUDED.composition_score,
+                face_quality_score=EXCLUDED.face_quality_score,
+                eyes_open_score=EXCLUDED.eyes_open_score,
+                gaze_score=EXCLUDED.gaze_score,
+                smile_score=EXCLUDED.smile_score,
+                subject_center_score=EXCLUDED.subject_center_score,
+                occlusion_penalty=EXCLUDED.occlusion_penalty,
+                stranger_penalty=EXCLUDED.stranger_penalty,
+                qwen_aesthetic_score=EXCLUDED.qwen_aesthetic_score,
+                persona_score=EXCLUDED.persona_score,
+                defect_penalty=EXCLUDED.defect_penalty,
+                duplicate_penalty=EXCLUDED.duplicate_penalty,
+                final_score=EXCLUDED.final_score,
+                similarity_caption=EXCLUDED.similarity_caption,
+                pose_key=EXCLUDED.pose_key,
+                quality_json=EXCLUDED.quality_json,
+                reasons=EXCLUDED.reasons,
+                score_status='completed',
+                score_error=NULL,
+                updated_at=now();
+        """, (
+            photo_id, str(photo["album_id"]), str(photo["album_event_id"]), album_type, persona_key,
+            cvq["sharpness_score"], cvq["exposure_score"], cvq["contrast_score"], cvq["noise_score"], cvq["motion_blur_score"],
+            composition, face_quality, eyes_open_score, gaze_score, smile_score,
+            subject_center_score, occlusion_penalty, stranger_penalty,
+            qwen_aesthetic, persona_score, defect_penalty, duplicate_penalty,
+            final_score, similarity_caption, pose_key, Json(quality_json), Json(reasons),
+            scoring_version,
+        ))
+        return True, None
+    except Exception as e:
+        err = repr(e)
+        execute_sql_best_effort("""
+            INSERT INTO photo_culling_scores(
+                photo_id, album_id, album_event_id, album_type, persona_key,
+                final_score, score_status, score_error, scoring_version, created_at, updated_at
+            )
+            VALUES(%s::uuid,%s::uuid,%s::uuid,%s,%s,0,'failed',%s,%s,now(),now())
+            ON CONFLICT(photo_id, scoring_version, persona_key)
+            DO UPDATE SET score_status='failed', score_error=EXCLUDED.score_error, updated_at=now();
+        """, (photo_id, str(photo["album_id"]), str(photo["album_event_id"]), album_type, persona_key, err, scoring_version))
+        return False, err
+
+
+def score_photos(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    album_ctx = restore_album_only(payload["album_slug"])
+    events = resolve_events_for_album(album_ctx, payload)
+    event_ids = [e["event_id"] for e in events]
+    if not event_ids:
+        return {"rows": 0, "ok": 0, "failed": 0, "errors": [], "message": "No events found"}
+
+    persona_key = payload.get("persona_key") or payload.get("album_type") or album_ctx.get("album_type") or "general"
+    scoring_version = payload.get("scoring_version") or CULLING_VERSION
+    limit = int(payload.get("limit") or payload.get("batch", {}).get("limit") or 100)
+    only_unscored = bool(payload.get("only_unscored", payload.get("batch", {}).get("only_unscored", True)))
+
+    where_extra = ""
+    params: List[Any] = [album_ctx["album_id"], event_ids]
+    if only_unscored:
+        where_extra = """
+          AND NOT EXISTS (
+              SELECT 1 FROM photo_culling_scores s
+              WHERE s.photo_id=p.id
+                AND s.persona_key=%s
+                AND s.scoring_version=%s
+                AND s.score_status='completed'
+          )
+        """
+        params.extend([persona_key, scoring_version])
+    params.append(limit)
+
+    rows = db_all(f"""
+        SELECT p.*, a.album_type
+        FROM photos p
+        JOIN albums a ON a.id=p.album_id
+        WHERE p.album_id=%s::uuid
+          AND p.album_event_id = ANY(%s::uuid[])
+          AND COALESCE(p.is_deleted,false)=false
+          AND p.compression_status='completed'
+          {where_extra}
+        ORDER BY p.created_at
+        LIMIT %s;
+    """, tuple(params))
+
+    ok = 0
+    failed = 0
+    errors = []
+    for photo in rows:
+        success, err = upsert_photo_culling_score(photo, {**payload, "persona_key": persona_key, "scoring_version": scoring_version})
+        if success:
+            ok += 1
+        else:
+            failed += 1
+            errors.append({"photo_id": str(photo["id"]), "file_name": photo.get("file_name"), "error": err})
+
+    return {"rows": len(rows), "ok": ok, "failed": failed, "errors": errors[:25], "persona_key": persona_key, "scoring_version": scoring_version}
+
+
+def load_image_embed_model():
+    global _IMAGE_EMBED_MODEL, _IMAGE_EMBED_PROCESSOR
+    if _IMAGE_EMBED_MODEL is not None and _IMAGE_EMBED_PROCESSOR is not None:
+        return _IMAGE_EMBED_MODEL, _IMAGE_EMBED_PROCESSOR
+
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
+    print(f"Loading image embedding model: {IMAGE_EMBED_MODEL_ID}", flush=True)
+    processor = CLIPProcessor.from_pretrained(IMAGE_EMBED_MODEL_ID)
+    model = CLIPModel.from_pretrained(IMAGE_EMBED_MODEL_ID)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    _IMAGE_EMBED_MODEL = model
+    _IMAGE_EMBED_PROCESSOR = processor
+    print(f"Image embedding model loaded on {device}", flush=True)
+    return model, processor
+
+
+def image_embed_photos(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    import torch
+
+    album_ctx = restore_album_only(payload["album_slug"])
+    events = resolve_events_for_album(album_ctx, payload)
+    event_ids = [e["event_id"] for e in events]
+    if not event_ids:
+        return {"rows": 0, "ok": 0, "failed": 0, "errors": [], "message": "No events found"}
+
+    model_id = payload.get("embedding_model") or IMAGE_EMBED_MODEL_ID
+    limit = int(payload.get("limit") or payload.get("batch", {}).get("limit") or 100)
+    only_missing = bool(payload.get("only_missing", payload.get("batch", {}).get("only_missing", True)))
+
+    where_extra = ""
+    params: List[Any] = [album_ctx["album_id"], event_ids]
+    if only_missing:
+        where_extra = """
+          AND NOT EXISTS (
+              SELECT 1 FROM photo_image_embeddings e
+              WHERE e.photo_id=p.id
+                AND e.embedding_model=%s
+                AND e.embedding IS NOT NULL
+          )
+        """
+        params.append(model_id)
+    params.append(limit)
+
+    rows = db_all(f"""
+        SELECT p.*
+        FROM photos p
+        WHERE p.album_id=%s::uuid
+          AND p.album_event_id = ANY(%s::uuid[])
+          AND COALESCE(p.is_deleted,false)=false
+          AND p.compression_status='completed'
+          {where_extra}
+        ORDER BY p.created_at
+        LIMIT %s;
+    """, tuple(params))
+
+    model, processor = load_image_embed_model()
+    device = next(model.parameters()).device
+    ok = 0
+    failed = 0
+    errors = []
+
+    for batch in chunks(rows, IMAGE_EMBED_BATCH_SIZE):
+        prepared = []
+        images = []
+        for photo in batch:
+            try:
+                local = download_best_available_photo(photo, "image-embed")
+                img = read_image_any(local)
+                prepared.append(photo)
+                images.append(img)
+            except Exception as e:
+                failed += 1
+                errors.append({"photo_id": str(photo["id"]), "file_name": photo.get("file_name"), "error": repr(e)})
+
+        if not images:
+            continue
+        try:
+            inputs = processor(images=images, return_tensors="pt", padding=True)
+            inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+            with torch.no_grad():
+                feats = model.get_image_features(**inputs)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+            arr = feats.detach().cpu().numpy().astype(np.float32)
+
+            upsert_rows = []
+            for i, photo in enumerate(prepared):
+                upsert_rows.append((
+                    str(photo["id"]), str(photo["album_id"]), str(photo["album_event_id"]),
+                    model_id, vector_to_pg(arr[i]), "completed", None,
+                ))
+
+            conn = get_conn()
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        execute_values(cur, """
+                            INSERT INTO photo_image_embeddings(
+                                photo_id, album_id, album_event_id, embedding_model,
+                                embedding, embedding_status, embedding_error, created_at, updated_at
+                            ) VALUES %s
+                            ON CONFLICT(photo_id, embedding_model)
+                            DO UPDATE SET
+                                embedding=EXCLUDED.embedding,
+                                embedding_status='completed',
+                                embedding_error=NULL,
+                                updated_at=now();
+                        """, upsert_rows, template="(%s::uuid,%s::uuid,%s::uuid,%s,%s::vector,%s,%s,now(),now())")
+            finally:
+                conn.close()
+            ok += len(prepared)
+            del inputs, feats
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            failed += len(prepared)
+            errors.append({"batch_error": repr(e)})
+
+    return {"rows": len(rows), "ok": ok, "failed": failed, "errors": errors[:25], "embedding_model": model_id}
+
+
+def fetch_people_sets(photo_ids: List[str]) -> Dict[str, set[str]]:
+    if not photo_ids:
+        return {}
+    rows = db_all("""
+        SELECT photo_id, person_id
+        FROM photo_people
+        WHERE photo_id = ANY(%s::uuid[])
+          AND person_id IS NOT NULL;
+    """, (photo_ids,))
+    out: Dict[str, set[str]] = {}
+    for r in rows:
+        out.setdefault(str(r["photo_id"]), set()).add(str(r["person_id"]))
+    return out
+
+
+def people_overlap(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 0.5
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, len(a | b))
+
+
+def cluster_photos(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    album_ctx = restore_album_only(payload["album_slug"])
+    events = resolve_events_for_album(album_ctx, payload)
+    event_ids = [e["event_id"] for e in events]
+    if not event_ids:
+        return {"clusters": 0, "items": 0, "message": "No events found"}
+
+    persona_key = payload.get("persona_key") or payload.get("album_type") or album_ctx.get("album_type") or "general"
+    scoring_version = payload.get("scoring_version") or CULLING_VERSION
+    cluster_version = payload.get("cluster_version") or CLUSTER_VERSION
+    embedding_model = payload.get("embedding_model") or IMAGE_EMBED_MODEL_ID
+    opts = payload.get("options") or {}
+    image_threshold = float(opts.get("image_similarity_threshold", 0.90))
+    text_threshold = float(opts.get("text_similarity_threshold", 0.84))
+    final_threshold = float(opts.get("final_similarity_threshold", 0.88))
+
+    rows = db_all("""
+        SELECT
+            p.id AS photo_id,
+            p.album_id,
+            p.album_event_id,
+            p.file_name,
+            p.search_embedding,
+            p.created_at,
+            s.final_score,
+            s.similarity_caption,
+            s.pose_key,
+            ie.embedding AS image_embedding
+        FROM photos p
+        JOIN photo_culling_scores s ON s.photo_id=p.id
+           AND s.persona_key=%s
+           AND s.scoring_version=%s
+           AND s.score_status='completed'
+        LEFT JOIN photo_image_embeddings ie ON ie.photo_id=p.id
+           AND ie.embedding_model=%s
+           AND ie.embedding IS NOT NULL
+        WHERE p.album_id=%s::uuid
+          AND p.album_event_id = ANY(%s::uuid[])
+          AND COALESCE(p.is_deleted,false)=false
+        ORDER BY p.album_event_id, p.created_at;
+    """, (persona_key, scoring_version, embedding_model, album_ctx["album_id"], event_ids))
+
+    if not rows:
+        return {"clusters": 0, "items": 0, "message": "No scored photos found"}
+
+    photo_ids = [str(r["photo_id"]) for r in rows]
+    people_by_photo = fetch_people_sets(photo_ids)
+    n = len(rows)
+    dsu = DSU(n)
+
+    image_vecs: List[Optional[np.ndarray]] = []
+    text_vecs: List[Optional[np.ndarray]] = []
+    for r in rows:
+        image_vecs.append(parse_pg_vector(r["image_embedding"]) if r.get("image_embedding") is not None else None)
+        text_vecs.append(parse_pg_vector(r["search_embedding"]) if r.get("search_embedding") is not None else None)
+
+    # O(n^2) is fine for current album sizes. For 50k+ photos, move this to FAISS nearest neighbors.
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Avoid grouping across events unless explicitly allowed.
+            if str(rows[i]["album_event_id"]) != str(rows[j]["album_event_id"]) and not opts.get("allow_cross_event_clusters", False):
+                continue
+
+            img_sim = float(np.dot(image_vecs[i], image_vecs[j])) if image_vecs[i] is not None and image_vecs[j] is not None else 0.0
+            txt_sim = float(np.dot(text_vecs[i], text_vecs[j])) if text_vecs[i] is not None and text_vecs[j] is not None else 0.0
+            ppl_sim = people_overlap(people_by_photo.get(str(rows[i]["photo_id"]), set()), people_by_photo.get(str(rows[j]["photo_id"]), set()))
+            pose_sim = 1.0 if (rows[i].get("pose_key") or "") == (rows[j].get("pose_key") or "") and rows[i].get("pose_key") else 0.0
+
+            final_sim = (img_sim * 0.55) + (txt_sim * 0.25) + (ppl_sim * 0.15) + (pose_sim * 0.05)
+            if img_sim >= image_threshold or (txt_sim >= text_threshold and final_sim >= final_threshold) or final_sim >= final_threshold:
+                dsu.union(i, j)
+
+    grouped: Dict[int, List[int]] = {}
+    for i in range(n):
+        grouped.setdefault(dsu.find(i), []).append(i)
+
+    # Replace previous clusters for this scope/version/persona.
+    execute_sql("""
+        DELETE FROM photo_similarity_clusters
+        WHERE album_id=%s::uuid
+          AND cluster_version=%s
+          AND persona_key=%s
+          AND album_event_id = ANY(%s::uuid[]);
+    """, (album_ctx["album_id"], cluster_version, persona_key, event_ids))
+
+    cluster_count = 0
+    item_count = 0
+
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for cluster_num, indices in enumerate(grouped.values(), start=1):
+                    cluster_rows = [rows[i] for i in indices]
+                    cluster_rows_sorted = sorted(cluster_rows, key=lambda r: float(r.get("final_score") or 0), reverse=True)
+                    winner = cluster_rows_sorted[0]
+                    rep = cluster_rows_sorted[0]
+                    event_id = str(rep["album_event_id"])
+                    cluster_key = f"{album_ctx['album_slug']}:{event_id}:{cluster_version}:{cluster_num}"
+                    cluster_caption = rep.get("similarity_caption") or rep.get("file_name") or "similar photos"
+                    pose_key = rep.get("pose_key") or "general"
+
+                    cur.execute("""
+                        INSERT INTO photo_similarity_clusters(
+                            album_id, album_event_id, cluster_key, cluster_type, persona_key,
+                            representative_photo_id, winner_photo_id, cluster_size,
+                            avg_similarity, max_similarity, cluster_caption, pose_key,
+                            cluster_status, cluster_version, created_at, updated_at
+                        ) VALUES(
+                            %s::uuid,%s::uuid,%s,'hybrid_similarity',%s,
+                            %s::uuid,%s::uuid,%s,
+                            NULL,NULL,%s,%s,
+                            'active',%s,now(),now()
+                        )
+                        RETURNING id;
+                    """, (
+                        album_ctx["album_id"], event_id, cluster_key, persona_key,
+                        str(rep["photo_id"]), str(winner["photo_id"]), len(cluster_rows),
+                        cluster_caption, pose_key, cluster_version,
+                    ))
+                    cluster_id = str(cur.fetchone()["id"])
+
+                    item_rows = []
+                    for rank, r in enumerate(cluster_rows_sorted, start=1):
+                        item_rows.append((
+                            cluster_id, str(r["photo_id"]), str(r["album_id"]), str(r["album_event_id"]),
+                            None, None, None, None, None,
+                            rank, str(r["photo_id"]) == str(winner["photo_id"]),
+                        ))
+                    execute_values(cur, """
+                        INSERT INTO photo_similarity_cluster_items(
+                            cluster_id, photo_id, album_id, album_event_id,
+                            image_similarity_score, text_similarity_score, people_overlap_score,
+                            timestamp_similarity_score, final_similarity_score,
+                            rank_in_cluster, is_cluster_winner, created_at
+                        ) VALUES %s;
+                    """, item_rows, template="(%s::uuid,%s::uuid,%s::uuid,%s::uuid,%s,%s,%s,%s,%s,%s,%s,now())")
+
+                    cluster_count += 1
+                    item_count += len(item_rows)
+    finally:
+        conn.close()
+
+    return {"clusters": cluster_count, "items": item_count, "photos": n, "persona_key": persona_key, "cluster_version": cluster_version}
+
+
+def select_best_photos(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    album_ctx = restore_album_only(payload["album_slug"])
+    events = resolve_events_for_album(album_ctx, payload)
+    event_ids = [e["event_id"] for e in events]
+    if not event_ids:
+        return {"selected_count": 0, "message": "No events found"}
+
+    limit = int(payload.get("limit") or payload.get("requested_count") or 100)
+    album_type = payload.get("album_type") or album_ctx.get("album_type") or "general"
+    persona_key = payload.get("persona_key") or album_type or "general"
+    scoring_version = payload.get("scoring_version") or CULLING_VERSION
+    cluster_version = payload.get("cluster_version") or CLUSTER_VERSION
+    opts = payload.get("options") or {}
+    max_per_cluster = int(opts.get("max_per_cluster", 1))
+    collection_name = payload.get("collection_name") or f"Best {limit} Photos"
+
+    # Prefer cluster winners. If clusters do not exist, fall back to top scores.
+    candidate_rows = db_all("""
+        WITH clustered AS (
+            SELECT
+                sci.photo_id,
+                sci.cluster_id,
+                sci.album_event_id,
+                s.final_score,
+                s.reasons,
+                sci.rank_in_cluster,
+                ROW_NUMBER() OVER(PARTITION BY sci.cluster_id ORDER BY s.final_score DESC) AS cluster_rank
+            FROM photo_similarity_cluster_items sci
+            JOIN photo_similarity_clusters c ON c.id=sci.cluster_id
+            JOIN photo_culling_scores s ON s.photo_id=sci.photo_id
+              AND s.persona_key=%s
+              AND s.scoring_version=%s
+              AND s.score_status='completed'
+            WHERE sci.album_id=%s::uuid
+              AND sci.album_event_id = ANY(%s::uuid[])
+              AND c.cluster_version=%s
+              AND c.persona_key=%s
+        )
+        SELECT *
+        FROM clustered
+        WHERE cluster_rank <= %s
+        ORDER BY final_score DESC
+        LIMIT %s;
+    """, (persona_key, scoring_version, album_ctx["album_id"], event_ids, cluster_version, persona_key, max_per_cluster, limit))
+
+    if not candidate_rows:
+        candidate_rows = db_all("""
+            SELECT
+                s.photo_id,
+                NULL::uuid AS cluster_id,
+                s.album_event_id,
+                s.final_score,
+                s.reasons,
+                1 AS rank_in_cluster,
+                1 AS cluster_rank
+            FROM photo_culling_scores s
+            JOIN photos p ON p.id=s.photo_id
+            WHERE s.album_id=%s::uuid
+              AND s.album_event_id = ANY(%s::uuid[])
+              AND s.persona_key=%s
+              AND s.scoring_version=%s
+              AND s.score_status='completed'
+              AND COALESCE(p.is_deleted,false)=false
+            ORDER BY s.final_score DESC
+            LIMIT %s;
+        """, (album_ctx["album_id"], event_ids, persona_key, scoring_version, limit))
+
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO best_photo_collections(
+                        album_id, name, collection_type, album_type, persona_key,
+                        requested_count, selected_count, selection_mode, status,
+                        config, created_by, created_at, updated_at
+                    ) VALUES(
+                        %s::uuid,%s,'ai_best_picks',%s,%s,
+                        %s,%s,%s,'completed',%s,%s,now(),now()
+                    )
+                    RETURNING id;
+                """, (
+                    album_ctx["album_id"], collection_name, album_type, persona_key,
+                    limit, len(candidate_rows), payload.get("selection_mode", "balanced"),
+                    Json(opts), payload.get("created_by"),
+                ))
+                collection_id = str(cur.fetchone()["id"])
+
+                item_rows = []
+                for rank, r in enumerate(candidate_rows, start=1):
+                    reasons = r.get("reasons") or []
+                    reason_text = ", ".join(reasons[:3]) if isinstance(reasons, list) else str(reasons or "AI selected best photo")
+                    item_rows.append((
+                        collection_id, str(r["photo_id"]), str(r["cluster_id"]) if r.get("cluster_id") else None,
+                        album_ctx["album_id"], str(r["album_event_id"]), rank, float(r.get("final_score") or 0),
+                        reason_text, Json({"reasons": reasons, "source": "ai_culling"}),
+                    ))
+
+                if item_rows:
+                    execute_values(cur, """
+                        INSERT INTO best_photo_collection_items(
+                            collection_id, photo_id, cluster_id, album_id, album_event_id,
+                            rank, score, reason, reason_json, created_at
+                        ) VALUES %s;
+                    """, item_rows, template="(%s::uuid,%s::uuid,%s::uuid,%s::uuid,%s::uuid,%s,%s,%s,%s,now())")
+    finally:
+        conn.close()
+
+    return {
+        "collection_id": collection_id,
+        "requested_count": limit,
+        "selected_count": len(candidate_rows),
+        "persona_key": persona_key,
+        "collection_name": collection_name,
+    }
+
+
+def best_photos_full(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Repeated calls are safe because each stage supports only_missing/only_unscored behavior.
+    score_payload = {**payload, "limit": int(payload.get("score_limit") or payload.get("limit") or 5000), "only_unscored": payload.get("only_unscored", True)}
+    embed_payload = {**payload, "limit": int(payload.get("embed_limit") or payload.get("limit") or 5000), "only_missing": payload.get("only_missing", True)}
+
+    update_job_status(job_id, "running", "score_photos", "Scoring photos for culling")
+    score_result = score_photos(job_id, score_payload)
+
+    update_job_status(job_id, "running", "image_embed_photos", "Generating image embeddings")
+    embed_result = image_embed_photos(job_id, embed_payload)
+
+    update_job_status(job_id, "running", "cluster_photos", "Clustering similar photos")
+    cluster_result = cluster_photos(job_id, payload)
+
+    update_job_status(job_id, "running", "select_best_photos", "Selecting best photos")
+    select_result = select_best_photos(job_id, payload)
+
+    return {
+        "score_photos": score_result,
+        "image_embed_photos": embed_result,
+        "cluster_photos": cluster_result,
+        "select_best_photos": select_result,
+    }
+
+
+def process_culling_mode(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    mode = payload.get("mode")
+    if not payload.get("album_slug"):
+        raise ValueError("Missing input.album_slug")
+
+    if mode == "score_photos":
+        return score_photos(job_id, payload)
+    if mode == "image_embed_photos":
+        return image_embed_photos(job_id, payload)
+    if mode == "cluster_photos":
+        return cluster_photos(job_id, payload)
+    if mode == "select_best_photos":
+        return select_best_photos(job_id, payload)
+    if mode == "best_photos_full":
+        return best_photos_full(job_id, payload)
+
+    raise ValueError(f"Unsupported culling mode: {mode}")
+
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
@@ -2842,13 +3679,25 @@ def handler(event):
                 "db_application_name": DB_APPLICATION_NAME,
             }
 
-        if "album_slug" not in payload:
-            raise ValueError("Missing input.album_slug")
+        culling_modes = {
+            "score_photos",
+            "image_embed_photos",
+            "cluster_photos",
+            "select_best_photos",
+            "best_photos_full",
+        }
 
-        if "events" not in payload or not payload["events"]:
-            raise ValueError("Missing input.events")
+        if payload.get("mode") in culling_modes:
+            result = process_culling_mode(job_id, payload)
+            update_job_status(job_id, "completed", payload.get("mode"), "Culling mode completed")
+        else:
+            if "album_slug" not in payload:
+                raise ValueError("Missing input.album_slug")
 
-        result = process_album_events(job_id, payload)
+            if "events" not in payload or not payload["events"]:
+                raise ValueError("Missing input.events")
+
+            result = process_album_events(job_id, payload)
 
         return {
             "ok": True,
