@@ -82,21 +82,7 @@ os.environ.setdefault("TRANSFORMERS_CACHE", "/runpod-volume/huggingface")
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/runpod-volume/huggingface/sentence-transformers")
 os.environ.setdefault("TORCH_HOME", "/runpod-volume/torch")
 os.environ.setdefault("XDG_CACHE_HOME", "/runpod-volume/cache")
-import os
 
-os.environ.setdefault("TORCH_CUDNN_V8_API_DISABLED", "1")
-os.environ.setdefault("CUDNN_FRONTEND_ATTN_DISABLED", "1")
-os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-try:
-    import torch
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = True
-except Exception:
-    pass
 Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["SENTENCE_TRANSFORMERS_HOME"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
@@ -3556,10 +3542,13 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
             "rebuild_people": False,
             "qwen": True,
             "embeddings": True,
+            # Runs AI culling after Qwen + text embeddings:
+            # score_photos -> image_embed_photos -> cluster_photos -> select_best_photos.
+            "culling": bool(payload.get("culling_enabled", payload.get("run_culling", True))),
             "cleanup_temp": bool(payload.get("cleanup_temp", False)),
         }
 
-    return payload.get("steps", {
+    default_steps = {
         "ingest": True,
         "compress": False,
         "face_index": False,
@@ -3567,8 +3556,18 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
         "rebuild_people": False,
         "qwen": False,
         "embeddings": False,
+        "culling": False,
         "cleanup_temp": False,
-    })
+    }
+
+    supplied = payload.get("steps")
+    if supplied:
+        merged = {**default_steps, **supplied}
+        if payload.get("culling_enabled") is not None or payload.get("run_culling") is not None:
+            merged["culling"] = bool(payload.get("culling_enabled", payload.get("run_culling")))
+        return merged
+
+    return default_steps
 
 
 def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3628,6 +3627,26 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     if steps.get("embeddings", False):
         update_job_status(job_id, "running", "embeddings", "Generating text embeddings")
         results["steps"]["embeddings"] = run_text_embeddings_for_events(album_ctx, db_events)
+
+    if steps.get("culling", False):
+        # Full best-photo pipeline. This uses the culling tables:
+        # photo_culling_scores, photo_image_embeddings,
+        # photo_similarity_clusters, photo_similarity_cluster_items,
+        # best_photo_collections, best_photo_collection_items.
+        culling_payload = {
+            **payload,
+            "album_slug": album_slug,
+            "album_type": payload.get("album_type") or album_ctx.get("album_type") or "general",
+            "persona_key": payload.get("persona_key") or payload.get("album_type") or album_ctx.get("album_type") or "general",
+            "limit": int(payload.get("best_photo_count") or payload.get("limit") or payload.get("requested_count") or 100),
+            "requested_count": int(payload.get("best_photo_count") or payload.get("limit") or payload.get("requested_count") or 100),
+            "score_limit": int(payload.get("score_limit") or payload.get("culling_score_limit") or 5000),
+            "embed_limit": int(payload.get("embed_limit") or payload.get("culling_embed_limit") or 5000),
+            "only_unscored": bool(payload.get("only_unscored", False)),
+            "only_missing": bool(payload.get("only_missing", False)),
+        }
+        update_job_status(job_id, "running", "best_photos_full", "Scoring, embedding, clustering, and selecting best photos")
+        results["steps"]["best_photos_full"] = best_photos_full(job_id, culling_payload)
 
     if steps.get("cleanup_temp", False):
         update_job_status(job_id, "running", "cleanup_temp", "Deleting temporary AI folders")
