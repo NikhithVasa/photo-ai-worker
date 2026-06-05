@@ -3,7 +3,14 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
+ENV TORCH_CUDNN_V8_API_DISABLED=1
+ENV CUDNN_FRONTEND_ATTN_DISABLED=1
+ENV CUDA_MODULE_LOADING=LAZY
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
@@ -22,17 +29,17 @@ COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --upgrade pip setuptools wheel
 RUN python3 -m pip install -r /app/requirements.txt
 
-ENV HF_HOME=/models/huggingface
-ENV TRANSFORMERS_CACHE=/models/huggingface
-ENV SENTENCE_TRANSFORMERS_HOME=/models/huggingface/sentence-transformers
-ENV TORCH_HOME=/models/torch
-ENV XDG_CACHE_HOME=/models/cache
+ENV HF_HOME=/runpod-volume/huggingface
+ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface
+ENV SENTENCE_TRANSFORMERS_HOME=/runpod-volume/huggingface/sentence-transformers
+ENV TORCH_HOME=/runpod-volume/torch
+ENV XDG_CACHE_HOME=/runpod-volume/cache
 
 RUN mkdir -p \
-    /models/huggingface \
-    /models/huggingface/sentence-transformers \
-    /models/torch \
-    /models/cache
+    /runpod-volume/huggingface \
+    /runpod-volume/huggingface/sentence-transformers \
+    /runpod-volume/torch \
+    /runpod-volume/cache
 
 RUN python3 - <<'PY'
 import torch

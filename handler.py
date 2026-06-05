@@ -82,7 +82,21 @@ os.environ.setdefault("TRANSFORMERS_CACHE", "/runpod-volume/huggingface")
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/runpod-volume/huggingface/sentence-transformers")
 os.environ.setdefault("TORCH_HOME", "/runpod-volume/torch")
 os.environ.setdefault("XDG_CACHE_HOME", "/runpod-volume/cache")
+import os
 
+os.environ.setdefault("TORCH_CUDNN_V8_API_DISABLED", "1")
+os.environ.setdefault("CUDNN_FRONTEND_ATTN_DISABLED", "1")
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+try:
+    import torch
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = True
+except Exception:
+    pass
 Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["SENTENCE_TRANSFORMERS_HOME"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
