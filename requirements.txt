@@ -9,9 +9,6 @@ pillow
 opencv-python-headless
 tqdm
 
-torch==2.5.1
-torchvision==0.20.1
-
 transformers==4.51.3
 accelerate
 safetensors
