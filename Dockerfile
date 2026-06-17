@@ -22,7 +22,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN python -m pip install -r /app/requirements.txt
 
@@ -40,34 +39,25 @@ RUN mkdir -p \
 
 RUN python - <<'PY'
 import torch
-print("torch:", torch.__version__)
-print("torch cuda:", torch.version.cuda)
-print("cuda available:", torch.cuda.is_available())
-print("device count:", torch.cuda.device_count())
-print("cudnn:", torch.backends.cudnn.version())
+print('torch:', torch.__version__)
+print('torch cuda:', torch.version.cuda)
+print('cuda available at build:', torch.cuda.is_available())
+print('device count at build:', torch.cuda.device_count())
+print('cudnn:', torch.backends.cudnn.version())
 PY
 
+# Download model weights into the image cache without trying to load the model into RAM during build.
 RUN python - <<'PY'
-import onnxruntime as ort
-print("onnxruntime:", ort.__version__)
-print("device:", ort.get_device())
-print("providers:", ort.get_available_providers())
-assert "CUDAExecutionProvider" in ort.get_available_providers(), "CUDAExecutionProvider missing"
-PY
-
-RUN python - <<'PY'
-from insightface.app import FaceAnalysis
-app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-app.prepare(ctx_id=-1, det_size=(640, 640))
-print("InsightFace buffalo_l downloaded")
+from huggingface_hub import snapshot_download
+snapshot_download('Qwen/Qwen2.5-VL-3B-Instruct')
+print('Downloaded Qwen/Qwen2.5-VL-3B-Instruct')
 PY
 
 RUN python - <<'PY'
 from sentence_transformers import SentenceTransformer
-SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-print("Downloaded sentence-transformers/all-MiniLM-L6-v2")
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+print('Downloaded sentence-transformers/all-MiniLM-L6-v2')
 PY
 
 COPY handler.py /app/handler.py
-
 CMD ["python", "-u", "/app/handler.py"]
