@@ -61,11 +61,38 @@ PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTIN
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
 
+# Image-to-text provider settings
+# Keep "qwen" for current behavior. Set "gemma" to use Gemma 4 12B.
+IMAGE_TEXT_MODEL_PROVIDER = (
+    os.environ.get("IMAGE_TEXT_MODEL_PROVIDER")
+    or os.environ.get("VISION_MODEL_PROVIDER")
+    or "qwen"
+).strip().lower()
+
+if IMAGE_TEXT_MODEL_PROVIDER not in {"qwen", "gemma"}:
+    raise RuntimeError(
+        "IMAGE_TEXT_MODEL_PROVIDER must be one of: qwen, gemma. "
+        f"Got: {IMAGE_TEXT_MODEL_PROVIDER!r}"
+    )
+
 # Qwen settings
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 QWEN_IMAGE_MAX_SIDE = int(os.environ.get("QWEN_IMAGE_MAX_SIDE", "448"))
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "320"))
 QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4"))
+
+# Gemma settings
+# For 24GB GPUs: start with GEMMA_QUANTIZATION=4bit. Try "none" only after a small test.
+GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
+GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", str(QWEN_IMAGE_MAX_SIDE)))
+GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", str(QWEN_MAX_NEW_TOKENS)))
+GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "1"))
+GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
+GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
+GEMMA_ATTN_IMPLEMENTATION = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
+
+if GEMMA_QUANTIZATION not in {"none", "4bit", "8bit"}:
+    raise RuntimeError("GEMMA_QUANTIZATION must be one of: none, 4bit, 8bit")
 
 # Text embedding settings
 TEXT_EMBED_MODEL_ID = os.environ.get("TEXT_EMBED_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
@@ -106,6 +133,8 @@ _FACE_APP = None
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
 _PROCESS_VISION_INFO = None
+_GEMMA_MODEL = None
+_GEMMA_PROCESSOR = None
 _TEXT_EMBED_MODEL = None
 _IMAGE_EMBED_MODEL = None
 _IMAGE_EMBED_PROCESSOR = None
@@ -505,12 +534,25 @@ def save_ai_input_webp(source_local: Path, output_local: Path) -> Tuple[int, int
     return img.size
 
 
-def make_qwen_image(input_path: Path, max_side: int = QWEN_IMAGE_MAX_SIDE) -> Path:
+def image_text_max_side() -> int:
+    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
+        return GEMMA_IMAGE_MAX_SIDE
+    return QWEN_IMAGE_MAX_SIDE
+
+
+def make_qwen_image(input_path: Path, max_side: Optional[int] = None) -> Path:
+    """
+    Historical name kept so the rest of the worker does not need a DB/status rename.
+    It prepares the smaller annotated image for either Qwen or Gemma.
+    """
+    max_side = int(max_side or image_text_max_side())
+
     img = Image.open(input_path).convert("RGB")
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-    out = input_path.parent / ("qwen_" + input_path.stem + ".jpg")
+    out = input_path.parent / (f"{IMAGE_TEXT_MODEL_PROVIDER}_" + input_path.stem + ".jpg")
     img.save(out, "JPEG", quality=82)
     return out
+
 
 
 # ============================================================
@@ -1809,6 +1851,93 @@ def load_qwen():
     return _QWEN_MODEL, _QWEN_PROCESSOR, _PROCESS_VISION_INFO
 
 
+
+def load_gemma():
+    global _GEMMA_MODEL, _GEMMA_PROCESSOR
+
+    if _GEMMA_MODEL is not None and _GEMMA_PROCESSOR is not None:
+        return _GEMMA_MODEL, _GEMMA_PROCESSOR
+
+    import torch
+    from transformers import AutoProcessor, BitsAndBytesConfig
+
+    try:
+        # Gemma 4 12B model card currently shows this class.
+        from transformers import AutoModelForMultimodalLM as GemmaModelClass
+    except Exception:
+        # Fallback for other recent Transformers builds / smaller variants.
+        from transformers import AutoModelForImageTextToText as GemmaModelClass
+
+    assert_torch_gpu_ready("Gemma")
+    print(
+        f"Loading Gemma model: {GEMMA_MODEL_ID}, "
+        f"quantization={GEMMA_QUANTIZATION}, "
+        f"attn={GEMMA_ATTN_IMPLEMENTATION}",
+        flush=True,
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        GEMMA_MODEL_ID,
+        trust_remote_code=True,
+    )
+
+    model_kwargs: Dict[str, Any] = {
+        "device_map": "auto",
+        "trust_remote_code": True,
+    }
+
+    if GEMMA_ATTN_IMPLEMENTATION:
+        model_kwargs["attn_implementation"] = GEMMA_ATTN_IMPLEMENTATION
+
+    if GEMMA_QUANTIZATION == "4bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    elif GEMMA_QUANTIZATION == "8bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+    else:
+        # Transformers 5 uses dtype; older builds may still expect torch_dtype.
+        model_kwargs["dtype"] = "auto"
+
+    try:
+        model = GemmaModelClass.from_pretrained(
+            GEMMA_MODEL_ID,
+            **model_kwargs,
+        )
+    except TypeError:
+        if "dtype" in model_kwargs:
+            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
+        model = GemmaModelClass.from_pretrained(
+            GEMMA_MODEL_ID,
+            **model_kwargs,
+        )
+
+    model.eval()
+
+    if STRICT_QWEN_GPU:
+        devices = {str(p.device) for p in model.parameters()}
+        print("Gemma parameter devices:", sorted(list(devices))[:10], flush=True)
+        if not any(d.startswith("cuda") for d in devices):
+            raise RuntimeError(f"Gemma model did not load on CUDA. Devices={sorted(list(devices))[:10]}")
+
+    _GEMMA_MODEL = model
+    _GEMMA_PROCESSOR = processor
+
+    print("Gemma loaded", flush=True)
+    return _GEMMA_MODEL, _GEMMA_PROCESSOR
+
+
+def image_text_inference_batch_size() -> int:
+    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
+        return max(1, GEMMA_INFERENCE_BATCH_SIZE)
+    return max(1, QWEN_INFERENCE_BATCH_SIZE)
+
+
 def qwen_prompt() -> str:
     return """
 Return only valid minified JSON. No markdown. No explanation.
@@ -2216,7 +2345,7 @@ def annotate_photo_with_faces(photo: Dict[str, Any], faces: List[Dict[str, Any]]
     return make_qwen_image(ann), faces
 
 
-def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
+def _qwen_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
     import torch
 
     model, processor, process_vision_info = load_qwen()
@@ -2284,6 +2413,146 @@ def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
 
     return [normalize_qwen_data(extract_json(o)) for o in outs]
 
+
+
+
+def _gemma_response_to_text(processor: Any, response: Any) -> str:
+    try:
+        parsed = processor.parse_response(response) if hasattr(processor, "parse_response") else response
+    except Exception:
+        parsed = response
+
+    if isinstance(parsed, str):
+        return parsed
+
+    if isinstance(parsed, dict):
+        for key in ("content", "response", "text", "answer"):
+            value = parsed.get(key)
+            if isinstance(value, str):
+                return value
+        return json.dumps(parsed, ensure_ascii=False)
+
+    if isinstance(parsed, list):
+        parts = []
+        for item in parsed:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if isinstance(value, str):
+                    parts.append(value)
+        if parts:
+            return "\n".join(parts)
+
+    return str(parsed or "")
+
+
+def _move_inputs_to_model(inputs: Any, model: Any) -> Any:
+    device = getattr(model, "device", None)
+
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except Exception:
+            device = "cuda"
+
+    model_dtype = getattr(model, "dtype", None)
+
+    try:
+        if model_dtype is not None:
+            return inputs.to(device, dtype=model_dtype)
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+    return inputs.to(device)
+
+
+def _gemma_describe_one(image_path: Path) -> Dict[str, Any]:
+    import torch
+
+    model, processor = load_gemma()
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                # Gemma HF examples use url for image paths.
+                {"type": "image", "url": str(image_path)},
+                {"type": "text", "text": qwen_prompt()},
+            ],
+        }
+    ]
+
+    template_kwargs: Dict[str, Any] = {
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+        "add_generation_prompt": True,
+    }
+
+    try:
+        inputs = processor.apply_chat_template(
+            messages,
+            enable_thinking=GEMMA_ENABLE_THINKING,
+            **template_kwargs,
+        )
+    except TypeError:
+        inputs = processor.apply_chat_template(
+            messages,
+            **template_kwargs,
+        )
+
+    inputs = _move_inputs_to_model(inputs, model)
+    input_len = inputs["input_ids"].shape[-1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=GEMMA_MAX_NEW_TOKENS,
+            do_sample=False,
+        )
+
+    response = processor.decode(
+        outputs[0][input_len:],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+    text = _gemma_response_to_text(processor, response)
+
+    del inputs, outputs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return normalize_qwen_data(extract_json(text))
+
+
+def _gemma_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
+    # Gemma 4 12B is much heavier than Qwen2.5-VL-3B, so keep this sequential
+    # unless you validate batch inference on your exact GPU.
+    results = []
+    for path in image_paths:
+        results.append(_gemma_describe_one(path))
+    return results
+
+
+def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
+    """
+    Backward-compatible name. The DB fields are still qwen_*,
+    but IMAGE_TEXT_MODEL_PROVIDER can now be qwen or gemma.
+    """
+    print(
+        f"Image-to-text provider={IMAGE_TEXT_MODEL_PROVIDER}, images={len(image_paths)}",
+        flush=True,
+    )
+
+    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
+        return _gemma_describe_batch_impl(image_paths)
+
+    return _qwen_describe_batch_impl(image_paths)
 
 def get_label_to_id(album_ctx: Dict[str, Any]) -> Dict[str, str]:
     people = db_all("""
@@ -2453,7 +2722,7 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
     fail = 0
     errors = []
 
-    for batch in chunks(rows, QWEN_INFERENCE_BATCH_SIZE):
+    for batch in chunks(rows, image_text_inference_batch_size()):
         prepared = []
 
         for photo in batch:
