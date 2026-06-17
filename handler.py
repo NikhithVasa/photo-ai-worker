@@ -10,10 +10,17 @@ import shutil
 import traceback
 import tempfile
 import subprocess
+import threading
+import faulthandler
+import signal
+import atexit
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+from botocore.config import Config
 import cv2
 import numpy as np
 import psycopg2
@@ -50,6 +57,16 @@ RESET_EXISTING_QWEN = os.environ.get("RESET_EXISTING_QWEN", "false").lower() == 
 AI_INPUT_MAX_SIDE = int(os.environ.get("AI_INPUT_MAX_SIDE", "1600"))
 AI_INPUT_WEBP_QUALITY = int(os.environ.get("AI_INPUT_WEBP_QUALITY", "88"))
 
+# Compression parallelism.
+# Compression is S3/network + CPU image encode. GPU is not used here.
+# Keep this conservative if your RDS is small; each worker only touches DB at the end.
+COMPRESS_MAX_WORKERS = int(os.environ.get("COMPRESS_MAX_WORKERS", "6"))
+COMPRESS_LOG_EVERY = int(os.environ.get("COMPRESS_LOG_EVERY", "25"))
+
+# If true, and ai_input_s3_key already exists in S3, mark compression completed without regenerating.
+# For a true full rerun, keep false. For faster retries, set true.
+COMPRESS_REUSE_EXISTING_AI_INPUT = os.environ.get("COMPRESS_REUSE_EXISTING_AI_INPUT", "false").lower() == "true"
+
 # Face settings
 FACE_DET_SIZE = tuple(
     int(x.strip()) for x in os.environ.get("FACE_DET_SIZE", "640,640").split(",")
@@ -61,38 +78,35 @@ PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTIN
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
 
-# Image-to-text provider settings
-# Keep "qwen" for current behavior. Set "gemma" to use Gemma 4 12B.
-IMAGE_TEXT_MODEL_PROVIDER = (
-    os.environ.get("IMAGE_TEXT_MODEL_PROVIDER")
-    or os.environ.get("VISION_MODEL_PROVIDER")
-    or "qwen"
-).strip().lower()
+# Safe reconcile debug / guardrails.
+# Keep expensive optional work disabled while debugging because RunPod can kill
+# the worker without a Python traceback if memory spikes.
+SAFE_RECONCILE_CROP_COVERS = os.environ.get("SAFE_RECONCILE_CROP_COVERS", "false").lower() == "true"
+SAFE_RECONCILE_DUP_CANDIDATES = os.environ.get("SAFE_RECONCILE_DUP_CANDIDATES", "false").lower() == "true"
+SAFE_RECONCILE_MEMORY_HEARTBEAT_SECONDS = int(os.environ.get("SAFE_RECONCILE_MEMORY_HEARTBEAT_SECONDS", "10"))
+SAFE_RECONCILE_MAX_UNLABELED_FACES = int(os.environ.get("SAFE_RECONCILE_MAX_UNLABELED_FACES", "5000"))
 
-if IMAGE_TEXT_MODEL_PROVIDER not in {"qwen", "gemma"}:
-    raise RuntimeError(
-        "IMAGE_TEXT_MODEL_PROVIDER must be one of: qwen, gemma. "
-        f"Got: {IMAGE_TEXT_MODEL_PROVIDER!r}"
-    )
+
+# Split-worker / GPU strictness settings.
+# Keep strict=true: the worker fails if detector/recognizer are not backed by CUDA.
+STRICT_FACE_GPU = os.environ.get("STRICT_FACE_GPU", "true").lower() == "true"
+INSIGHTFACE_ALLOWED_MODULES = [
+    x.strip()
+    for x in os.environ.get("INSIGHTFACE_ALLOWED_MODULES", "detection,recognition").split(",")
+    if x.strip()
+]
+
+# Qwen endpoint injected by Lambda/RunPod template. QWEN_RUN_URL is preferred;
+# QWEN_ENDPOINT_ID is kept as a fallback.
+QWEN_ENDPOINT_ID = os.environ.get("QWEN_ENDPOINT_ID")
+QWEN_RUN_URL = os.environ.get("QWEN_RUN_URL")
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
 
 # Qwen settings
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 QWEN_IMAGE_MAX_SIDE = int(os.environ.get("QWEN_IMAGE_MAX_SIDE", "448"))
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "320"))
 QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4"))
-
-# Gemma settings
-# For 24GB GPUs: start with GEMMA_QUANTIZATION=4bit. Try "none" only after a small test.
-GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
-GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", str(QWEN_IMAGE_MAX_SIDE)))
-GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", str(QWEN_MAX_NEW_TOKENS)))
-GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "1"))
-GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
-GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
-GEMMA_ATTN_IMPLEMENTATION = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
-
-if GEMMA_QUANTIZATION not in {"none", "4bit", "8bit"}:
-    raise RuntimeError("GEMMA_QUANTIZATION must be one of: none, 4bit, 8bit")
 
 # Text embedding settings
 TEXT_EMBED_MODEL_ID = os.environ.get("TEXT_EMBED_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
@@ -103,9 +117,6 @@ IMAGE_EMBED_MODEL_ID = os.environ.get("IMAGE_EMBED_MODEL_ID", "openai/clip-vit-b
 IMAGE_EMBED_BATCH_SIZE = int(os.environ.get("IMAGE_EMBED_BATCH_SIZE", "16"))
 CULLING_VERSION = os.environ.get("CULLING_VERSION", "v1")
 CLUSTER_VERSION = os.environ.get("CLUSTER_VERSION", "v1")
-
-# Split-worker strict GPU setting. Keep true so Qwen/CLIP/text embedding do not silently run on CPU.
-STRICT_QWEN_GPU = os.environ.get("STRICT_QWEN_GPU", "true").lower() == "true"
 
 os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/runpod-volume/huggingface")
@@ -118,23 +129,32 @@ Path(os.environ["SENTENCE_TRANSFORMERS_HOME"]).mkdir(parents=True, exist_ok=True
 Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
 IMAGE_EXTS = {
-    ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif",
-    ".nef", ".cr2", ".arw", ".dng", ".tif", ".tiff"
+    ".jpg", ".jpeg", ".jpe", ".png", ".webp", ".heic", ".heif",
+    ".nef", ".cr2", ".arw", ".dng", ".tif", ".tiff",
+    ".bmp", ".gif", ".avif", ".jfif"
 }
+
+RAW_IMAGE_EXTS = {".nef", ".cr2", ".arw", ".dng"}
+HEIF_IMAGE_EXTS = {".heic", ".heif"}
 
 UUID_PREFIX_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_.+",
     re.IGNORECASE,
 )
 
-s3 = boto3.client("s3", region_name=AWS_DEFAULT_REGION)
+s3 = boto3.client(
+    "s3",
+    region_name=AWS_DEFAULT_REGION,
+    config=Config(
+        max_pool_connections=max(32, COMPRESS_MAX_WORKERS * 4),
+        retries={"max_attempts": 8, "mode": "standard"},
+    ),
+)
 
 _FACE_APP = None
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
 _PROCESS_VISION_INFO = None
-_GEMMA_MODEL = None
-_GEMMA_PROCESSOR = None
 _TEXT_EMBED_MODEL = None
 _IMAGE_EMBED_MODEL = None
 _IMAGE_EMBED_PROCESSOR = None
@@ -148,10 +168,104 @@ _TABLE_COLUMNS_CACHE: Dict[str, set[str]] = {}
 _HAS_TABLE_CACHE: Dict[str, bool] = {}
 
 DB_POOL_MIN_CONN = int(os.environ.get("DB_POOL_MIN_CONN", "1"))
-DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "3"))
+DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "8"))
 DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "8"))
 DB_CONNECT_BASE_SLEEP = float(os.environ.get("DB_CONNECT_BASE_SLEEP", "0.75"))
 DB_APPLICATION_NAME = os.environ.get("DB_APPLICATION_NAME", "photo_ai_worker")
+
+
+# ============================================================
+# PROCESS / MEMORY DEBUG HELPERS
+# ============================================================
+
+def install_process_debug_handlers() -> None:
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception as e:
+        print(f"[PROCESS] faulthandler enable failed: {repr(e)}", flush=True)
+
+    print(f"[PROCESS] pid={os.getpid()} starting", flush=True)
+
+    def _on_exit():
+        print(f"[PROCESS] pid={os.getpid()} exiting via atexit", flush=True)
+
+    try:
+        atexit.register(_on_exit)
+    except Exception:
+        pass
+
+    def _handle_signal(signum, frame):
+        print(f"[PROCESS] received signal={signum}", flush=True)
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+
+    for _sig in [signal.SIGTERM, signal.SIGINT]:
+        try:
+            signal.signal(_sig, _handle_signal)
+        except Exception:
+            pass
+
+
+def _read_proc_status_kb(field: str) -> int:
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    parts = line.split()
+                    return int(parts[1])
+    except Exception:
+        return -1
+    return -1
+
+
+def log_memory(tag: str) -> None:
+    rss_kb = _read_proc_status_kb("VmRSS")
+    hwm_kb = _read_proc_status_kb("VmHWM")
+    size_kb = _read_proc_status_kb("VmSize")
+
+    print(
+        f"[MEM] {tag} "
+        f"rss_mb={rss_kb / 1024:.1f} "
+        f"peak_rss_mb={hwm_kb / 1024:.1f} "
+        f"vmsize_mb={size_kb / 1024:.1f}",
+        flush=True,
+    )
+
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.STDOUT,
+            timeout=5,
+            text=True,
+        ).strip()
+
+        print(f"[GPU_MEM] {tag} {out}", flush=True)
+    except Exception as e:
+        print(f"[GPU_MEM] {tag} unavailable: {repr(e)}", flush=True)
+
+
+def start_memory_heartbeat(label: str, every_seconds: int = 10):
+    stop_event = threading.Event()
+
+    def _loop():
+        i = 0
+        while not stop_event.is_set():
+            log_memory(f"{label} heartbeat={i}")
+            i += 1
+            stop_event.wait(every_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return stop_event
+
+
+install_process_debug_handlers()
 
 
 # ============================================================
@@ -242,12 +356,12 @@ def _init_db_pool():
 
     assert_env_ready()
 
-    from psycopg2.pool import SimpleConnectionPool
+    from psycopg2.pool import ThreadedConnectionPool
 
     last_err = None
     for attempt in range(DB_CONNECT_RETRIES):
         try:
-            _DB_POOL = SimpleConnectionPool(
+            _DB_POOL = ThreadedConnectionPool(
                 minconn=DB_POOL_MIN_CONN,
                 maxconn=DB_POOL_MAX_CONN,
                 **_connect_kwargs(),
@@ -284,7 +398,9 @@ def get_conn():
 
             return PooledDbConnection(pool_obj, conn)
 
-        except psycopg2.OperationalError as e:
+        except Exception as e:
+            # Threaded compression can temporarily exhaust the tiny DB pool.
+            # Retry instead of failing the photo immediately.
             last_err = e
             sleep_for = min(20.0, DB_CONNECT_BASE_SLEEP * (2 ** attempt))
             print(
@@ -443,7 +559,23 @@ def mean_normalized(vectors: List[np.ndarray]) -> np.ndarray:
 # ============================================================
 
 def is_image_key(key: str) -> bool:
-    return Path(key).suffix.lower() in IMAGE_EXTS
+    # S3 keys under source_prefix/originals are supposed to be photos.
+    # Be liberal here so unusual extensions still get ingested; compression
+    # will attempt to decode and mark failed only if the content is not an image.
+    if not key or key.endswith("/"):
+        return False
+
+    name = Path(key).name
+    if name.startswith(".") or name.lower() in {"thumbs.db", ".ds_store"}:
+        return False
+
+    ext = Path(key).suffix.lower()
+    if ext in IMAGE_EXTS:
+        return True
+
+    # If the key is inside an originals folder, try it even with unknown extension.
+    # This supports photographer uploads with odd file suffixes.
+    return "/originals/" in key
 
 
 def is_generated_original_key(key: str) -> bool:
@@ -504,9 +636,18 @@ def delete_s3_prefix(prefix: str) -> int:
 # ============================================================
 
 def read_image_any(local_path: Path) -> Image.Image:
+    """
+    Read common photographer image formats by content, not only by extension.
+
+    Supported:
+    - JPEG/PNG/WebP/TIFF/BMP/GIF/AVIF if Pillow supports it in the image
+    - HEIC/HEIF if pillow-heif is installed
+    - RAW files NEF/CR2/ARW/DNG via rawpy
+    - Unknown extensions are still attempted with PIL and then OpenCV
+    """
     ext = local_path.suffix.lower()
 
-    if ext in {".nef", ".cr2", ".arw", ".dng"}:
+    if ext in RAW_IMAGE_EXTS:
         try:
             import rawpy
             with rawpy.imread(str(local_path)) as raw:
@@ -519,11 +660,34 @@ def read_image_any(local_path: Path) -> Image.Image:
         except Exception as e:
             raise RuntimeError(
                 f"RAW image read failed for {local_path}. "
-                "Install rawpy/imageio or convert RAW before upload."
+                "Install rawpy or convert RAW before upload."
             ) from e
 
-    img = Image.open(local_path)
-    return ImageOps.exif_transpose(img).convert("RGB")
+    if ext in HEIF_IMAGE_EXTS:
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except Exception as e:
+            print(f"HEIF opener not available for {local_path}: {repr(e)}", flush=True)
+
+    try:
+        img = Image.open(local_path)
+        img.load()
+        return ImageOps.exif_transpose(img).convert("RGB")
+    except Exception as pil_err:
+        # Last fallback: OpenCV can decode some images by content even when the suffix is odd.
+        try:
+            data = np.fromfile(str(local_path), dtype=np.uint8)
+            bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise RuntimeError("cv2.imdecode returned None")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb).convert("RGB")
+        except Exception as cv_err:
+            raise RuntimeError(
+                f"Image read failed for {local_path}. "
+                f"PIL error={repr(pil_err)}; OpenCV error={repr(cv_err)}"
+            ) from cv_err
 
 
 def save_ai_input_webp(source_local: Path, output_local: Path) -> Tuple[int, int]:
@@ -534,25 +698,12 @@ def save_ai_input_webp(source_local: Path, output_local: Path) -> Tuple[int, int
     return img.size
 
 
-def image_text_max_side() -> int:
-    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
-        return GEMMA_IMAGE_MAX_SIDE
-    return QWEN_IMAGE_MAX_SIDE
-
-
-def make_qwen_image(input_path: Path, max_side: Optional[int] = None) -> Path:
-    """
-    Historical name kept so the rest of the worker does not need a DB/status rename.
-    It prepares the smaller annotated image for either Qwen or Gemma.
-    """
-    max_side = int(max_side or image_text_max_side())
-
+def make_qwen_image(input_path: Path, max_side: int = QWEN_IMAGE_MAX_SIDE) -> Path:
     img = Image.open(input_path).convert("RGB")
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-    out = input_path.parent / (f"{IMAGE_TEXT_MODEL_PROVIDER}_" + input_path.stem + ".jpg")
+    out = input_path.parent / ("qwen_" + input_path.stem + ".jpg")
     img.save(out, "JPEG", quality=82)
     return out
-
 
 
 # ============================================================
@@ -953,8 +1104,12 @@ def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
 # COMPRESSION / AI INPUT
 # ============================================================
 
-def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
+def compress_one_photo(
+    row: Dict[str, Any],
+    photo_cols: Optional[set[str]] = None,
+) -> Tuple[str, str, Optional[str]]:
     photo_id = str(row["id"])
+
     try:
         tmpdir = LOCAL_WORK / "compress" / photo_id
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -963,12 +1118,6 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
         if not source_key:
             raise RuntimeError("missing original/source S3 key")
 
-        original_local = tmpdir / Path(source_key).name
-        ai_local = tmpdir / "ai.webp"
-
-        download_file(source_key, original_local)
-        width, height = save_ai_input_webp(original_local, ai_local)
-
         ai_key = row.get("ai_input_s3_key")
         if not ai_key:
             album_slug = row["storage_album_slug"]
@@ -976,16 +1125,43 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
             photo_uuid = row.get("photo_uuid") or photo_id
             ai_key = f"albums/{album_slug}/events/{event_slug}/ai-input/{photo_uuid}.webp"
 
+        # Optional fast path for retries: do not regenerate if the AI input object already exists.
+        if COMPRESS_REUSE_EXISTING_AI_INPUT and ai_key and s3_key_exists(ai_key):
+            cols = photo_cols or table_columns("photos")
+            set_parts = [
+                "compression_status='completed'",
+                "compression_error=NULL",
+                "ai_input_s3_key=%s",
+                "updated_at=now()",
+            ]
+            values: List[Any] = [ai_key]
+            values.append(photo_id)
+            execute_sql(
+                f"""
+                UPDATE photos
+                SET {", ".join(set_parts)}
+                WHERE id=%s::uuid;
+                """,
+                tuple(values),
+            )
+            return "ok", photo_id, None
+
+        suffix = Path(source_key).suffix or ".img"
+        original_local = tmpdir / f"original{suffix}"
+        ai_local = tmpdir / "ai.webp"
+
+        download_file(source_key, original_local)
+        width, height = save_ai_input_webp(original_local, ai_local)
         upload_file(ai_local, ai_key, "image/webp")
 
-        cols = table_columns("photos")
+        cols = photo_cols or table_columns("photos")
         set_parts = [
             "compression_status='completed'",
             "compression_error=NULL",
             "ai_input_s3_key=%s",
-            "updated_at=now()"
+            "updated_at=now()",
         ]
-        values = [ai_key]
+        values: List[Any] = [ai_key]
 
         if "width" in cols:
             set_parts.append("width=%s")
@@ -1009,7 +1185,7 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
 
     except Exception as e:
         err = repr(e)
-        execute_sql("""
+        execute_sql_best_effort("""
             UPDATE photos
             SET compression_status='failed',
                 compression_error=%s,
@@ -1017,6 +1193,13 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
             WHERE id=%s::uuid;
         """, (err, photo_id))
         return "failed", photo_id, err
+
+    finally:
+        # Keep /tmp from growing during big albums.
+        try:
+            shutil.rmtree(LOCAL_WORK / "compress" / photo_id, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1033,19 +1216,66 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
         ORDER BY created_at;
     """, (album_id, event_ids))
 
+    if not rows:
+        result = {
+            "rows": 0,
+            "ok": 0,
+            "failed": 0,
+            "errors": [],
+            "parallel": True,
+            "workers": 0,
+        }
+        print("Compression result:", result, flush=True)
+        return result
+
+    worker_count = max(1, min(COMPRESS_MAX_WORKERS, len(rows)))
+    photo_cols = table_columns("photos")
+
     ok = 0
     failed = 0
     errors = []
+    started = time.time()
 
-    for row in rows:
-        status, photo_id, err = compress_one_photo(row)
-        if status == "ok":
-            ok += 1
-        else:
-            failed += 1
-            errors.append({"photo_id": photo_id, "error": err})
+    print(
+        f"Compression parallel start: rows={len(rows)}, workers={worker_count}, "
+        f"reuse_existing_ai_input={COMPRESS_REUSE_EXISTING_AI_INPUT}",
+        flush=True,
+    )
 
-    result = {"rows": len(rows), "ok": ok, "failed": failed, "errors": errors[:25]}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(compress_one_photo, row, photo_cols) for row in rows]
+
+        for i, future in enumerate(as_completed(futures), start=1):
+            try:
+                status, photo_id, err = future.result()
+            except Exception as e:
+                status, photo_id, err = "failed", "unknown", repr(e)
+
+            if status == "ok":
+                ok += 1
+            else:
+                failed += 1
+                if len(errors) < 25:
+                    errors.append({"photo_id": photo_id, "error": err})
+
+            if COMPRESS_LOG_EVERY > 0 and (i % COMPRESS_LOG_EVERY == 0 or i == len(rows)):
+                elapsed = max(0.001, time.time() - started)
+                print(
+                    f"Compression progress: {i}/{len(rows)} done, ok={ok}, failed={failed}, "
+                    f"rate={i / elapsed:.2f} photos/sec",
+                    flush=True,
+                )
+
+    result = {
+        "rows": len(rows),
+        "ok": ok,
+        "failed": failed,
+        "errors": errors[:25],
+        "parallel": True,
+        "workers": worker_count,
+        "seconds": round(time.time() - started, 2),
+        "photos_per_second": round(len(rows) / max(0.001, time.time() - started), 3),
+    }
     print("Compression result:", result, flush=True)
     return result
 
@@ -1054,87 +1284,390 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
 # INSIGHTFACE
 # ============================================================
 
-def preload_cuda_libs_for_onnxruntime():
+class InsightFaceCudaLoader:
     """
-    Helps ONNXRuntime load CUDA/cuDNN libraries from pip packages and CUDA image
-    before it falls back to incompatible system libraries.
+    Strict CUDA loader for InsightFace + ONNXRuntime.
+
+    Why this exists:
+    - ort.get_available_providers() can show CUDAExecutionProvider even when CUDA cannot actually load.
+    - InsightFace may silently fall back to CPUExecutionProvider.
+    - We want to fail early if required CUDA/cuDNN libs are missing.
     """
-    import os
-    import site
-    import glob
-    import ctypes
 
-    candidate_dirs = []
-
-    for base in site.getsitepackages():
-        candidate_dirs.extend(glob.glob(os.path.join(base, "nvidia", "*", "lib")))
-
-    existing = os.environ.get("LD_LIBRARY_PATH", "")
-    os.environ["LD_LIBRARY_PATH"] = ":".join(candidate_dirs + ([existing] if existing else []))
-
-    preload_names = [
-        "libcublas.so.12",
-        "libcublasLt.so.12",
-        "libcudart.so.12",
+    REQUIRED_CUDNN_LIBS = [
         "libcudnn.so.9",
+        "libcudnn_adv.so.9",
+        "libcudnn_cnn.so.9",
         "libcudnn_graph.so.9",
         "libcudnn_ops.so.9",
-        "libcudnn_cnn.so.9",
-        "libnvrtc.so.12",
     ]
 
-    loaded = []
-    for d in candidate_dirs:
-        for name in preload_names:
-            path = os.path.join(d, name)
-            if os.path.exists(path):
-                try:
-                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-                    loaded.append(path)
-                except Exception as e:
-                    print(f"Could not preload {path}: {e}", flush=True)
+    OPTIONAL_CUDNN_LIBS = [
+        "libcudnn_engines_precompiled.so.9",
+        "libcudnn_engines_runtime_compiled.so.9",
+        "libcudnn_heuristic.so.9",
+    ]
 
-    print("CUDA preload dirs:", candidate_dirs, flush=True)
-    print("CUDA preloaded libs:", loaded, flush=True)
+    CUDA_LIBS = [
+        "libcuda.so.1",
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libcufft.so.11",
+        "libcurand.so.10",
+        "libcusolver.so.11",
+        "libcusparse.so.12",
+        "libnvrtc.so.12",
+        "libnvJitLink.so.12",
+        "libnvToolsExt.so.1",
+    ]
+
+    def __init__(
+        self,
+        det_size: Tuple[int, int],
+        allowed_modules: List[str],
+        strict_gpu: bool = True,
+    ):
+        self.det_size = det_size
+        self.allowed_modules = allowed_modules
+        self.strict_gpu = strict_gpu
+
+    def find_candidate_lib_dirs(self) -> List[str]:
+        import site
+        import sysconfig
+        import glob
+
+        dirs: List[str] = []
+
+        for base in site.getsitepackages():
+            dirs.extend(glob.glob(os.path.join(base, "nvidia", "*", "lib")))
+
+        user_site = site.getusersitepackages()
+        if user_site:
+            dirs.extend(glob.glob(os.path.join(user_site, "nvidia", "*", "lib")))
+
+        purelib = sysconfig.get_paths().get("purelib")
+        if purelib:
+            dirs.extend(glob.glob(os.path.join(purelib, "nvidia", "*", "lib")))
+
+        dirs.extend([
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda/compat",
+            "/usr/lib/x86_64-linux-gnu",
+            "/opt/conda/lib",
+        ])
+
+        clean: List[str] = []
+        seen = set()
+
+        for d in dirs:
+            if not d:
+                continue
+            if not os.path.isdir(d):
+                continue
+            if d in seen:
+                continue
+            seen.add(d)
+            clean.append(d)
+
+        return clean
+
+    def update_library_path(self, candidate_dirs: List[str]) -> None:
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        parts = candidate_dirs + ([existing] if existing else [])
+        os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+        # ONNXRuntime also checks this in some CUDA builds.
+        existing_ort = os.environ.get("ORT_CUDA_LIB_PATH", "")
+        if not existing_ort:
+            cuda_dirs = [
+                d for d in candidate_dirs
+                if "/nvidia/" in d or "/cuda" in d or "conda" in d
+            ]
+            if cuda_dirs:
+                os.environ["ORT_CUDA_LIB_PATH"] = ":".join(cuda_dirs)
+
+    def find_lib(self, candidate_dirs: List[str], lib_name: str) -> Optional[str]:
+        for d in candidate_dirs:
+            path = os.path.join(d, lib_name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def preload_one(self, path: str) -> Tuple[bool, Optional[str]]:
+        import ctypes
+
+        try:
+            ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            return True, None
+        except Exception as e:
+            return False, repr(e)
+
+    def preload_cuda_libs_for_onnxruntime(self) -> Dict[str, Any]:
+        """
+        Preload CUDA/cuDNN from pip-installed nvidia packages before InsightFace creates sessions.
+
+        This intentionally fails if required cuDNN 9 split libs are missing.
+        """
+        candidate_dirs = self.find_candidate_lib_dirs()
+        self.update_library_path(candidate_dirs)
+
+        loaded: List[str] = []
+        failed: List[Dict[str, str]] = []
+        found_required: Dict[str, Optional[str]] = {}
+
+        # Load lower-level CUDA libs first.
+        for lib_name in self.CUDA_LIBS:
+            path = self.find_lib(candidate_dirs, lib_name)
+            if not path:
+                continue
+
+            ok, err = self.preload_one(path)
+            if ok:
+                loaded.append(path)
+            else:
+                failed.append({"lib": lib_name, "path": path, "error": err or ""})
+
+        # Required cuDNN libs.
+        for lib_name in self.REQUIRED_CUDNN_LIBS:
+            path = self.find_lib(candidate_dirs, lib_name)
+            found_required[lib_name] = path
+
+            if not path:
+                continue
+
+            ok, err = self.preload_one(path)
+            if ok:
+                loaded.append(path)
+            else:
+                failed.append({"lib": lib_name, "path": path, "error": err or ""})
+
+        # Optional cuDNN libs. Load if present.
+        found_optional: Dict[str, Optional[str]] = {}
+        for lib_name in self.OPTIONAL_CUDNN_LIBS:
+            path = self.find_lib(candidate_dirs, lib_name)
+            found_optional[lib_name] = path
+
+            if not path:
+                continue
+
+            ok, err = self.preload_one(path)
+            if ok:
+                loaded.append(path)
+            else:
+                failed.append({"lib": lib_name, "path": path, "error": err or ""})
+
+        missing_required = [
+            name for name, path in found_required.items()
+            if not path
+        ]
+
+        payload = {
+            "candidate_dirs": candidate_dirs,
+            "loaded": loaded,
+            "failed": failed,
+            "found_required_cudnn": found_required,
+            "found_optional_cudnn": found_optional,
+            "missing_required_cudnn": missing_required,
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+            "ort_cuda_lib_path": os.environ.get("ORT_CUDA_LIB_PATH", ""),
+        }
+
+        print("CUDA preload result:", json.dumps(payload, default=str), flush=True)
+
+        if missing_required:
+            raise RuntimeError(
+                "Missing required cuDNN libraries for ONNXRuntime CUDAExecutionProvider: "
+                f"{missing_required}. "
+                "Fix Docker image requirements. Add nvidia-cudnn-cu12, rebuild without cache, "
+                "and do not allow CPU fallback."
+            )
+
+        hard_failures = [
+            f for f in failed
+            if f["lib"] in self.REQUIRED_CUDNN_LIBS
+        ]
+
+        if hard_failures:
+            raise RuntimeError(
+                "Required cuDNN libraries were found but failed to preload: "
+                f"{hard_failures}"
+            )
+
+        return payload
+
+    def print_torch_status(self) -> None:
+        import torch
+
+        print("torch:", torch.__version__, flush=True)
+        print("torch cuda:", torch.version.cuda, flush=True)
+        print("torch cuda available:", torch.cuda.is_available(), flush=True)
+        print("torch device count:", torch.cuda.device_count(), flush=True)
+
+        if torch.cuda.is_available():
+            print("torch gpu name:", torch.cuda.get_device_name(0), flush=True)
+            print("torch gpu capability:", torch.cuda.get_device_capability(0), flush=True)
+
+    def validate_torch_cuda(self) -> None:
+        import torch
+
+        if not self.strict_gpu:
+            return
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "STRICT_FACE_GPU=true but torch.cuda.is_available() is false. "
+                "Refusing to run face indexing on CPU."
+            )
+
+        try:
+            # Real CUDA execution check, not just availability.
+            x = torch.randn((256, 256), device="cuda")
+            y = x @ x
+            torch.cuda.synchronize()
+            del x, y
+        except Exception as e:
+            raise RuntimeError(
+                "Torch CUDA test failed. Refusing to run face indexing."
+            ) from e
+
+    def get_onnxruntime_providers(self) -> List[str]:
+        import onnxruntime as ort
+
+        try:
+            ort.set_default_logger_severity(2)
+        except Exception:
+            pass
+
+        available = ort.get_available_providers()
+        print("onnxruntime:", ort.__version__, flush=True)
+        print("ONNXRuntime device:", ort.get_device(), flush=True)
+        print("ONNXRuntime providers:", available, flush=True)
+        return available
+
+    def build_provider_list(self) -> List[Any]:
+        return [
+            (
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0,
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "0",
+                    "do_copy_in_default_stream": "1",
+                },
+            ),
+
+            # CPU is listed second only as fallback for unsupported ops.
+            # We still validate detection/recognition sessions start with CUDA.
+            "CPUExecutionProvider",
+        ]
+
+    def load(self):
+        self.preload_cuda_libs_for_onnxruntime()
+
+        self.print_torch_status()
+        self.validate_torch_cuda()
+
+        available = self.get_onnxruntime_providers()
+
+        if "CUDAExecutionProvider" not in available:
+            raise RuntimeError(
+                f"CUDAExecutionProvider missing. Available providers={available}. "
+                "Refusing to run InsightFace on CPU because GPU is required."
+            )
+
+        from insightface.app import FaceAnalysis
+
+        providers = self.build_provider_list()
+
+        print("InsightFace allowed modules:", self.allowed_modules, flush=True)
+        print("InsightFace provider request:", providers, flush=True)
+
+        app = FaceAnalysis(
+            name="buffalo_l",
+            providers=providers,
+            allowed_modules=self.allowed_modules,
+        )
+
+        app.prepare(ctx_id=0, det_size=self.det_size)
+
+        required_models = set(self.allowed_modules)
+        loaded_models = set(app.models.keys())
+
+        print("InsightFace loaded models:", sorted(loaded_models), flush=True)
+
+        missing = required_models - loaded_models
+        if missing:
+            raise RuntimeError(
+                f"InsightFace did not load required modules: {sorted(missing)}"
+            )
+
+        provider_report: Dict[str, List[str]] = {}
+
+        for name, model in app.models.items():
+            sess = getattr(model, "session", None)
+            if not sess:
+                print(
+                    f"InsightFace model {name} has no ONNX session; skipping provider validation",
+                    flush=True,
+                )
+                continue
+
+            session_providers = sess.get_providers()
+            provider_report[name] = session_providers
+
+            print(
+                f"InsightFace model {name} providers: {session_providers}",
+                flush=True,
+            )
+
+            if self.strict_gpu and name in required_models:
+                if not session_providers:
+                    raise RuntimeError(
+                        f"InsightFace required model {name} has no providers."
+                    )
+
+                if session_providers[0] != "CUDAExecutionProvider":
+                    raise RuntimeError(
+                        f"InsightFace required model {name} did not start with CUDA first. "
+                        f"Providers={session_providers}. "
+                        "This usually means ONNXRuntime CUDA provider could not load cuDNN/CUDA libs."
+                    )
+
+        print(
+            "InsightFace required models loaded with CUDAExecutionProvider:",
+            provider_report,
+            flush=True,
+        )
+
+        return app
+
+
+def preload_cuda_libs_for_onnxruntime():
+    """
+    Backward-compatible wrapper for existing code.
+    """
+    loader = InsightFaceCudaLoader(
+        det_size=FACE_DET_SIZE,
+        allowed_modules=INSIGHTFACE_ALLOWED_MODULES,
+        strict_gpu=STRICT_FACE_GPU,
+    )
+    return loader.preload_cuda_libs_for_onnxruntime()
 
 
 def load_face_app():
     global _FACE_APP
+
     if _FACE_APP is not None:
         return _FACE_APP
 
-    preload_cuda_libs_for_onnxruntime()
+    loader = InsightFaceCudaLoader(
+        det_size=FACE_DET_SIZE,
+        allowed_modules=INSIGHTFACE_ALLOWED_MODULES,
+        strict_gpu=STRICT_FACE_GPU,
+    )
 
-    import onnxruntime as ort
-    from insightface.app import FaceAnalysis
-
-    available = ort.get_available_providers()
-    print("ONNXRuntime providers:", available, flush=True)
-
-    if "CUDAExecutionProvider" not in available:
-        raise RuntimeError(
-            f"CUDAExecutionProvider missing. Available providers={available}. "
-            "Refusing to run InsightFace on CPU because GPU is expected."
-        )
-
-    providers = [
-        (
-            "CUDAExecutionProvider",
-            {
-                "device_id": 0,
-                "cudnn_conv_algo_search": "HEURISTIC",
-                "do_copy_in_default_stream": "1",
-                "cudnn_conv_use_max_workspace": "0"
-            }
-        ),
-        "CPUExecutionProvider"
-    ]
-
-    app = FaceAnalysis(name="buffalo_l", providers=providers)
-    app.prepare(ctx_id=0, det_size=FACE_DET_SIZE)
-
-    _FACE_APP = app
-    print("InsightFace loaded on GPU", flush=True)
+    _FACE_APP = loader.load()
     return _FACE_APP
 
 
@@ -1312,227 +1845,371 @@ class DSU:
 
 
 def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assign only currently-unlabeled faces to existing/new people.
+
+    Critical fixes for RunPod silent-death debugging:
+    - Logs memory before/after every heavy section.
+    - Adds heartbeat logs while this step runs.
+    - Skips cover cropping and duplicate candidate generation by default.
+    - Keeps Qwen from being blocked by optional expensive people-maintenance work.
+    """
     album_id = album_ctx["album_id"]
 
-    face_rows = db_all("""
-        SELECT
-            f.id,
-            f.album_id,
-            f.album_event_id,
-            f.photo_id,
-            f.embedding,
-            f.face_quality_score,
-            f.detection_confidence
-        FROM faces f
-        WHERE f.album_id = %s::uuid
-          AND f.person_id IS NULL
-        ORDER BY f.face_quality_score DESC NULLS LAST, f.created_at;
-    """, (album_id,))
-
-    if not face_rows:
-        rebuild_photo_people_base_safe(album_ctx)
-        return {
-            "unlabeled_faces": 0,
-            "assigned_to_existing_people": 0,
-            "new_people_created": 0,
-            "message": "No unlabeled faces found. Existing people untouched.",
-        }
-
-    existing_people = db_all("""
-        SELECT
-            id,
-            person_number,
-            display_name,
-            default_name,
-            centroid_embedding
-        FROM people
-        WHERE album_id = %s::uuid
-          AND COALESCE(is_hidden, false) = false
-          AND centroid_embedding IS NOT NULL
-        ORDER BY person_number;
-    """, (album_id,))
-
-    face_vecs = [parse_pg_vector(r["embedding"]) for r in face_rows]
-
-    assigned_to_existing = []
-    remaining_indices = list(range(len(face_rows)))
-
-    if existing_people:
-        people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
-        P = np.stack(people_vecs).astype(np.float32)
-        F = np.stack(face_vecs).astype(np.float32)
-
-        sims = F @ P.T
-        best_people_idx = sims.argmax(axis=1)
-        best_scores = sims.max(axis=1)
-
-        still_remaining = []
-
-        for i, score in enumerate(best_scores):
-            if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
-                person = existing_people[int(best_people_idx[i])]
-                assigned_to_existing.append((str(person["id"]), str(face_rows[i]["id"])))
-            else:
-                still_remaining.append(i)
-
-        remaining_indices = still_remaining
-
-    new_clusters: Dict[int, List[int]] = {}
-
-    if remaining_indices:
-        if len(remaining_indices) == 1:
-            new_clusters[0] = remaining_indices
-        else:
-            X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
-            sims = X @ X.T
-            dsu = DSU(len(remaining_indices))
-
-            for i in range(len(remaining_indices)):
-                for j in range(i + 1, len(remaining_indices)):
-                    if float(sims[i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
-                        dsu.union(i, j)
-
-            temp: Dict[int, List[int]] = {}
-            for local_i, original_i in enumerate(remaining_indices):
-                root = dsu.find(local_i)
-                temp.setdefault(root, []).append(original_i)
-
-            new_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
-
-    conn = get_conn()
-    new_people_created = 0
+    print("[SAFE_RECONCILE] start", flush=True)
+    log_memory("safe_reconcile_start")
+    heartbeat_stop = start_memory_heartbeat(
+        "safe_reconcile",
+        every_seconds=max(1, SAFE_RECONCILE_MEMORY_HEARTBEAT_SECONDS),
+    )
 
     try:
-        with conn:
-            with conn.cursor() as cur:
-                if assigned_to_existing:
-                    execute_values(
-                        cur,
-                        """
-                        UPDATE faces AS f
-                        SET person_id = v.person_id::uuid
-                        FROM (VALUES %s) AS v(person_id, face_id)
-                        WHERE f.id = v.face_id::uuid;
-                        """,
-                        assigned_to_existing,
-                        template="(%s, %s)"
-                    )
+        print("[SAFE_RECONCILE] load unlabeled faces start", flush=True)
+        log_memory("before_load_unlabeled_faces")
 
-                cur.execute("""
-                    SELECT COALESCE(MAX(person_number), 0) AS max_num
-                    FROM people
-                    WHERE album_id = %s::uuid;
-                """, (album_id,))
-                next_num = int(cur.fetchone()["max_num"] or 0) + 1
+        face_rows = db_all("""
+            SELECT
+                f.id,
+                f.album_id,
+                f.album_event_id,
+                f.photo_id,
+                f.embedding,
+                f.face_quality_score,
+                f.detection_confidence
+            FROM faces f
+            WHERE f.album_id = %s::uuid
+              AND f.person_id IS NULL
+            ORDER BY f.face_quality_score DESC NULLS LAST, f.created_at;
+        """, (album_id,))
 
-                for _, face_indices in new_clusters.items():
-                    group_faces = [face_rows[i] for i in face_indices]
-                    group_vecs = [face_vecs[i] for i in face_indices]
+        print(f"[SAFE_RECONCILE] unlabeled_faces={len(face_rows)}", flush=True)
+        log_memory("after_load_unlabeled_faces")
 
-                    centroid = mean_normalized(group_vecs)
-                    best_face = sorted(
-                        group_faces,
-                        key=lambda r: float(r.get("face_quality_score") or 0),
-                        reverse=True,
-                    )[0]
+        if len(face_rows) > SAFE_RECONCILE_MAX_UNLABELED_FACES:
+            raise RuntimeError(
+                f"Too many unlabeled faces for one reconcile run: {len(face_rows)}. "
+                f"SAFE_RECONCILE_MAX_UNLABELED_FACES={SAFE_RECONCILE_MAX_UNLABELED_FACES}. "
+                "Increase the env var or split reconcile into smaller event/batch jobs."
+            )
 
-                    default_name = f"Person {next_num}"
+        if not face_rows:
+            print("[SAFE_RECONCILE] no unlabeled faces; rebuild_photo_people start", flush=True)
+            photo_people_result = rebuild_photo_people_base_safe(album_ctx)
+            print(f"[SAFE_RECONCILE] no unlabeled faces; rebuild_photo_people done: {photo_people_result}", flush=True)
+
+            result = {
+                "unlabeled_faces": 0,
+                "assigned_to_existing_people": 0,
+                "new_people_created": 0,
+                "photo_people": photo_people_result,
+                "message": "No unlabeled faces found. Existing people untouched.",
+            }
+
+            print(f"[SAFE_RECONCILE] done: {result}", flush=True)
+            log_memory("safe_reconcile_done_no_unlabeled")
+            return result
+
+        print("[SAFE_RECONCILE] load existing people start", flush=True)
+        log_memory("before_load_existing_people")
+
+        existing_people = db_all("""
+            SELECT
+                id,
+                person_number,
+                display_name,
+                default_name,
+                centroid_embedding
+            FROM people
+            WHERE album_id = %s::uuid
+              AND COALESCE(is_hidden, false) = false
+              AND centroid_embedding IS NOT NULL
+            ORDER BY person_number;
+        """, (album_id,))
+
+        print(f"[SAFE_RECONCILE] existing_people={len(existing_people)}", flush=True)
+        log_memory("after_load_existing_people")
+
+        print("[SAFE_RECONCILE] parse face vectors start", flush=True)
+        face_vecs = [parse_pg_vector(r["embedding"]) for r in face_rows]
+        print(f"[SAFE_RECONCILE] face_vecs={len(face_vecs)}", flush=True)
+        log_memory("after_parse_face_vectors")
+
+        assigned_to_existing = []
+        remaining_indices = list(range(len(face_rows)))
+
+        if existing_people:
+            print("[SAFE_RECONCILE] existing similarity match start", flush=True)
+            log_memory("before_existing_similarity")
+
+            people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
+            P = np.stack(people_vecs).astype(np.float32)
+            F = np.stack(face_vecs).astype(np.float32)
+
+            print(f"[SAFE_RECONCILE] existing similarity shapes F={F.shape} P={P.shape}", flush=True)
+
+            sims = F @ P.T
+            best_people_idx = sims.argmax(axis=1)
+            best_scores = sims.max(axis=1)
+
+            still_remaining = []
+
+            for i, score in enumerate(best_scores):
+                if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
+                    person = existing_people[int(best_people_idx[i])]
+                    assigned_to_existing.append((str(person["id"]), str(face_rows[i]["id"])))
+                else:
+                    still_remaining.append(i)
+
+            remaining_indices = still_remaining
+
+            # Free big arrays before new clustering / DB writes.
+            del P, F, sims, best_people_idx, best_scores
+            gc.collect()
+
+            print(
+                f"[SAFE_RECONCILE] existing similarity done assigned_existing={len(assigned_to_existing)} "
+                f"remaining={len(remaining_indices)}",
+                flush=True,
+            )
+            log_memory("after_existing_similarity")
+
+        new_clusters: Dict[int, List[int]] = {}
+
+        if remaining_indices:
+            print(f"[SAFE_RECONCILE] new clustering start remaining={len(remaining_indices)}", flush=True)
+            log_memory("before_new_clustering")
+
+            if len(remaining_indices) == 1:
+                new_clusters[0] = remaining_indices
+            else:
+                X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
+                print(f"[SAFE_RECONCILE] new clustering matrix X={X.shape}", flush=True)
+                log_memory("before_new_similarity_matrix")
+
+                sims = X @ X.T
+                print(f"[SAFE_RECONCILE] new clustering similarity matrix shape={sims.shape}", flush=True)
+                log_memory("after_new_similarity_matrix")
+
+                dsu = DSU(len(remaining_indices))
+
+                for i in range(len(remaining_indices)):
+                    if i > 0 and i % 250 == 0:
+                        print(f"[SAFE_RECONCILE] new clustering progress i={i}/{len(remaining_indices)}", flush=True)
+                        log_memory(f"new_clustering_progress_{i}")
+
+                    for j in range(i + 1, len(remaining_indices)):
+                        if float(sims[i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
+                            dsu.union(i, j)
+
+                temp: Dict[int, List[int]] = {}
+                for local_i, original_i in enumerate(remaining_indices):
+                    root = dsu.find(local_i)
+                    temp.setdefault(root, []).append(original_i)
+
+                new_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
+
+                # Free pairwise matrix before DB writes.
+                del X, sims
+                gc.collect()
+
+            print(f"[SAFE_RECONCILE] new clustering done new_clusters={len(new_clusters)}", flush=True)
+            log_memory("after_new_clustering")
+
+        print(
+            f"[SAFE_RECONCILE] db write start assigned_existing={len(assigned_to_existing)} "
+            f"new_clusters={len(new_clusters)}",
+            flush=True,
+        )
+        log_memory("before_db_write")
+
+        conn = get_conn()
+        new_people_created = 0
+
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    if assigned_to_existing:
+                        print(f"[SAFE_RECONCILE] updating existing face assignments count={len(assigned_to_existing)}", flush=True)
+                        execute_values(
+                            cur,
+                            """
+                            UPDATE faces AS f
+                            SET person_id = v.person_id::uuid
+                            FROM (VALUES %s) AS v(person_id, face_id)
+                            WHERE f.id = v.face_id::uuid;
+                            """,
+                            assigned_to_existing,
+                            template="(%s, %s)"
+                        )
 
                     cur.execute("""
-                        INSERT INTO people(
+                        SELECT COALESCE(MAX(person_number), 0) AS max_num
+                        FROM people
+                        WHERE album_id = %s::uuid;
+                    """, (album_id,))
+                    next_num = int(cur.fetchone()["max_num"] or 0) + 1
+
+                    for cluster_idx, face_indices in new_clusters.items():
+                        if cluster_idx > 0 and cluster_idx % 100 == 0:
+                            print(
+                                f"[SAFE_RECONCILE] creating people progress cluster={cluster_idx}/{len(new_clusters)} "
+                                f"created={new_people_created}",
+                                flush=True,
+                            )
+                            log_memory(f"db_write_cluster_{cluster_idx}")
+
+                        group_faces = [face_rows[i] for i in face_indices]
+                        group_vecs = [face_vecs[i] for i in face_indices]
+
+                        centroid = mean_normalized(group_vecs)
+                        best_face = sorted(
+                            group_faces,
+                            key=lambda r: float(r.get("face_quality_score") or 0),
+                            reverse=True,
+                        )[0]
+
+                        default_name = f"Person {next_num}"
+
+                        cur.execute("""
+                            INSERT INTO people(
+                                album_id,
+                                person_number,
+                                default_name,
+                                display_name,
+                                cover_photo_id,
+                                centroid_embedding,
+                                face_count,
+                                photo_count,
+                                occurrence_count,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (
+                                %s::uuid,
+                                %s,
+                                %s,
+                                %s,
+                                %s::uuid,
+                                %s::vector,
+                                %s,
+                                %s,
+                                %s,
+                                now(),
+                                now()
+                            )
+                            RETURNING id;
+                        """, (
                             album_id,
-                            person_number,
+                            next_num,
                             default_name,
-                            display_name,
-                            cover_photo_id,
-                            centroid_embedding,
-                            face_count,
-                            photo_count,
-                            occurrence_count,
-                            created_at,
-                            updated_at
+                            default_name,
+                            str(best_face["photo_id"]),
+                            vector_to_pg(centroid),
+                            len(group_faces),
+                            len(set(str(f["photo_id"]) for f in group_faces)),
+                            len(set(str(f["photo_id"]) for f in group_faces)),
+                        ))
+
+                        person_id = str(cur.fetchone()["id"])
+                        face_update_rows = [(person_id, str(f["id"])) for f in group_faces]
+
+                        execute_values(
+                            cur,
+                            """
+                            UPDATE faces AS f
+                            SET person_id = v.person_id::uuid
+                            FROM (VALUES %s) AS v(person_id, face_id)
+                            WHERE f.id = v.face_id::uuid;
+                            """,
+                            face_update_rows,
+                            template="(%s, %s)"
                         )
-                        VALUES (
-                            %s::uuid,
-                            %s,
-                            %s,
-                            %s,
-                            %s::uuid,
-                            %s::vector,
-                            %s,
-                            %s,
-                            %s,
-                            now(),
-                            now()
+
+                        next_num += 1
+                        new_people_created += 1
+
+                    print("[SAFE_RECONCILE] updating people stats start", flush=True)
+                    cur.execute("""
+                        WITH stats AS (
+                            SELECT
+                                person_id,
+                                COUNT(*) AS face_count,
+                                COUNT(DISTINCT photo_id) AS photo_count
+                            FROM faces
+                            WHERE album_id = %s::uuid
+                              AND person_id IS NOT NULL
+                            GROUP BY person_id
                         )
-                        RETURNING id;
-                    """, (
-                        album_id,
-                        next_num,
-                        default_name,
-                        default_name,
-                        str(best_face["photo_id"]),
-                        vector_to_pg(centroid),
-                        len(group_faces),
-                        len(set(str(f["photo_id"]) for f in group_faces)),
-                        len(set(str(f["photo_id"]) for f in group_faces)),
-                    ))
+                        UPDATE people p
+                        SET
+                            face_count = stats.face_count,
+                            photo_count = stats.photo_count,
+                            occurrence_count = stats.photo_count,
+                            updated_at = now()
+                        FROM stats
+                        WHERE p.id = stats.person_id
+                          AND p.album_id = %s::uuid;
+                    """, (album_id, album_id))
 
-                    person_id = str(cur.fetchone()["id"])
+        finally:
+            conn.close()
 
-                    face_update_rows = [(person_id, str(f["id"])) for f in group_faces]
+        print("[SAFE_RECONCILE] db write done", flush=True)
+        log_memory("after_db_write")
 
-                    execute_values(
-                        cur,
-                        """
-                        UPDATE faces AS f
-                        SET person_id = v.person_id::uuid
-                        FROM (VALUES %s) AS v(person_id, face_id)
-                        WHERE f.id = v.face_id::uuid;
-                        """,
-                        face_update_rows,
-                        template="(%s, %s)"
-                    )
+        # Let the biggest Python-side data go before downstream maintenance.
+        unlabeled_faces_count = len(face_rows)
+        assigned_existing_count = len(assigned_to_existing)
 
-                    next_num += 1
-                    new_people_created += 1
+        try:
+            del face_vecs
+            del face_rows
+        except Exception:
+            pass
 
-                cur.execute("""
-                    WITH stats AS (
-                        SELECT
-                            person_id,
-                            COUNT(*) AS face_count,
-                            COUNT(DISTINCT photo_id) AS photo_count
-                        FROM faces
-                        WHERE album_id = %s::uuid
-                          AND person_id IS NOT NULL
-                        GROUP BY person_id
-                    )
-                    UPDATE people p
-                    SET
-                        face_count = stats.face_count,
-                        photo_count = stats.photo_count,
-                        occurrence_count = stats.photo_count,
-                        updated_at = now()
-                    FROM stats
-                    WHERE p.id = stats.person_id
-                      AND p.album_id = %s::uuid;
-                """, (album_id, album_id))
+        gc.collect()
+        log_memory("after_free_face_arrays")
+
+        print("[SAFE_RECONCILE] rebuild_photo_people start", flush=True)
+        photo_people_result = rebuild_photo_people_base_safe(album_ctx)
+        print(f"[SAFE_RECONCILE] rebuild_photo_people done: {photo_people_result}", flush=True)
+        log_memory("after_rebuild_photo_people")
+
+        cover_result = {"skipped": True, "reason": "SAFE_RECONCILE_CROP_COVERS=false"}
+        if SAFE_RECONCILE_CROP_COVERS:
+            print("[SAFE_RECONCILE] crop covers start", flush=True)
+            cover_result = crop_and_upload_missing_person_covers(album_ctx)
+            print(f"[SAFE_RECONCILE] crop covers done: {cover_result}", flush=True)
+            log_memory("after_crop_covers")
+
+        duplicate_result = {"skipped": True, "reason": "SAFE_RECONCILE_DUP_CANDIDATES=false"}
+        if SAFE_RECONCILE_DUP_CANDIDATES:
+            print("[SAFE_RECONCILE] duplicate candidates start", flush=True)
+            duplicate_result = build_duplicate_candidates(album_ctx)
+            print(f"[SAFE_RECONCILE] duplicate candidates done: {duplicate_result}", flush=True)
+            log_memory("after_duplicate_candidates")
+
+        result = {
+            "unlabeled_faces": unlabeled_faces_count,
+            "assigned_to_existing_people": assigned_existing_count,
+            "new_people_created": new_people_created,
+            "existing_people_untouched": True,
+            "names_preserved": True,
+            "photo_people": photo_people_result,
+            "covers": cover_result,
+            "duplicate_candidates": duplicate_result,
+        }
+
+        print(f"[SAFE_RECONCILE] done: {result}", flush=True)
+        log_memory("safe_reconcile_done")
+        return result
 
     finally:
-        conn.close()
-
-    rebuild_photo_people_base_safe(album_ctx)
-    crop_and_upload_missing_person_covers(album_ctx)
-    build_duplicate_candidates(album_ctx)
-
-    return {
-        "unlabeled_faces": len(face_rows),
-        "assigned_to_existing_people": len(assigned_to_existing),
-        "new_people_created": new_people_created,
-        "existing_people_untouched": True,
-        "names_preserved": True,
-    }
+        try:
+            heartbeat_stop.set()
+        except Exception:
+            pass
+        log_memory("safe_reconcile_finally")
 
 
 def rebuild_photo_people_base_safe(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
@@ -1782,25 +2459,6 @@ def build_duplicate_candidates(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
     return {"candidates": len(candidates)}
 
 
-
-def assert_torch_gpu_ready(component: str):
-    import torch
-
-    print(f"{component} torch:", torch.__version__, flush=True)
-    print(f"{component} torch cuda:", torch.version.cuda, flush=True)
-    print(f"{component} cuda available:", torch.cuda.is_available(), flush=True)
-    print(f"{component} device count:", torch.cuda.device_count(), flush=True)
-
-    if torch.cuda.is_available():
-        print(f"{component} gpu name:", torch.cuda.get_device_name(0), flush=True)
-        return torch.device("cuda")
-
-    if STRICT_QWEN_GPU:
-        raise RuntimeError(f"STRICT_QWEN_GPU=true but CUDA is not available for {component}")
-
-    return torch.device("cpu")
-
-
 # ============================================================
 # QWEN
 # ============================================================
@@ -1825,7 +2483,6 @@ def load_qwen():
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     from qwen_vl_utils import process_vision_info
 
-    assert_torch_gpu_ready("Qwen")
     print(f"Loading Qwen model: {QWEN_MODEL_ID}", flush=True)
 
     processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
@@ -1837,105 +2494,12 @@ def load_qwen():
     )
     model.eval()
 
-    if STRICT_QWEN_GPU:
-        devices = {str(p.device) for p in model.parameters()}
-        print("Qwen parameter devices:", sorted(list(devices))[:10], flush=True)
-        if not any(d.startswith("cuda") for d in devices):
-            raise RuntimeError(f"Qwen model did not load on CUDA. Devices={sorted(list(devices))[:10]}")
-
     _QWEN_MODEL = model
     _QWEN_PROCESSOR = processor
     _PROCESS_VISION_INFO = process_vision_info
 
     print("Qwen loaded", flush=True)
     return _QWEN_MODEL, _QWEN_PROCESSOR, _PROCESS_VISION_INFO
-
-
-
-def load_gemma():
-    global _GEMMA_MODEL, _GEMMA_PROCESSOR
-
-    if _GEMMA_MODEL is not None and _GEMMA_PROCESSOR is not None:
-        return _GEMMA_MODEL, _GEMMA_PROCESSOR
-
-    import torch
-    from transformers import AutoProcessor, BitsAndBytesConfig
-
-    try:
-        # Gemma 4 12B model card currently shows this class.
-        from transformers import AutoModelForMultimodalLM as GemmaModelClass
-    except Exception:
-        # Fallback for other recent Transformers builds / smaller variants.
-        from transformers import AutoModelForImageTextToText as GemmaModelClass
-
-    assert_torch_gpu_ready("Gemma")
-    print(
-        f"Loading Gemma model: {GEMMA_MODEL_ID}, "
-        f"quantization={GEMMA_QUANTIZATION}, "
-        f"attn={GEMMA_ATTN_IMPLEMENTATION}",
-        flush=True,
-    )
-
-    processor = AutoProcessor.from_pretrained(
-        GEMMA_MODEL_ID,
-        trust_remote_code=True,
-    )
-
-    model_kwargs: Dict[str, Any] = {
-        "device_map": "auto",
-        "trust_remote_code": True,
-    }
-
-    if GEMMA_ATTN_IMPLEMENTATION:
-        model_kwargs["attn_implementation"] = GEMMA_ATTN_IMPLEMENTATION
-
-    if GEMMA_QUANTIZATION == "4bit":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-    elif GEMMA_QUANTIZATION == "8bit":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_8bit=True,
-        )
-    else:
-        # Transformers 5 uses dtype; older builds may still expect torch_dtype.
-        model_kwargs["dtype"] = "auto"
-
-    try:
-        model = GemmaModelClass.from_pretrained(
-            GEMMA_MODEL_ID,
-            **model_kwargs,
-        )
-    except TypeError:
-        if "dtype" in model_kwargs:
-            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
-        model = GemmaModelClass.from_pretrained(
-            GEMMA_MODEL_ID,
-            **model_kwargs,
-        )
-
-    model.eval()
-
-    if STRICT_QWEN_GPU:
-        devices = {str(p.device) for p in model.parameters()}
-        print("Gemma parameter devices:", sorted(list(devices))[:10], flush=True)
-        if not any(d.startswith("cuda") for d in devices):
-            raise RuntimeError(f"Gemma model did not load on CUDA. Devices={sorted(list(devices))[:10]}")
-
-    _GEMMA_MODEL = model
-    _GEMMA_PROCESSOR = processor
-
-    print("Gemma loaded", flush=True)
-    return _GEMMA_MODEL, _GEMMA_PROCESSOR
-
-
-def image_text_inference_batch_size() -> int:
-    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
-        return max(1, GEMMA_INFERENCE_BATCH_SIZE)
-    return max(1, QWEN_INFERENCE_BATCH_SIZE)
 
 
 def qwen_prompt() -> str:
@@ -2345,7 +2909,7 @@ def annotate_photo_with_faces(photo: Dict[str, Any], faces: List[Dict[str, Any]]
     return make_qwen_image(ann), faces
 
 
-def _qwen_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
+def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
     import torch
 
     model, processor, process_vision_info = load_qwen()
@@ -2413,146 +2977,6 @@ def _qwen_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
 
     return [normalize_qwen_data(extract_json(o)) for o in outs]
 
-
-
-
-def _gemma_response_to_text(processor: Any, response: Any) -> str:
-    try:
-        parsed = processor.parse_response(response) if hasattr(processor, "parse_response") else response
-    except Exception:
-        parsed = response
-
-    if isinstance(parsed, str):
-        return parsed
-
-    if isinstance(parsed, dict):
-        for key in ("content", "response", "text", "answer"):
-            value = parsed.get(key)
-            if isinstance(value, str):
-                return value
-        return json.dumps(parsed, ensure_ascii=False)
-
-    if isinstance(parsed, list):
-        parts = []
-        for item in parsed:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                value = item.get("text") or item.get("content")
-                if isinstance(value, str):
-                    parts.append(value)
-        if parts:
-            return "\n".join(parts)
-
-    return str(parsed or "")
-
-
-def _move_inputs_to_model(inputs: Any, model: Any) -> Any:
-    device = getattr(model, "device", None)
-
-    if device is None:
-        try:
-            device = next(model.parameters()).device
-        except Exception:
-            device = "cuda"
-
-    model_dtype = getattr(model, "dtype", None)
-
-    try:
-        if model_dtype is not None:
-            return inputs.to(device, dtype=model_dtype)
-    except TypeError:
-        pass
-    except Exception:
-        pass
-
-    return inputs.to(device)
-
-
-def _gemma_describe_one(image_path: Path) -> Dict[str, Any]:
-    import torch
-
-    model, processor = load_gemma()
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                # Gemma HF examples use url for image paths.
-                {"type": "image", "url": str(image_path)},
-                {"type": "text", "text": qwen_prompt()},
-            ],
-        }
-    ]
-
-    template_kwargs: Dict[str, Any] = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "add_generation_prompt": True,
-    }
-
-    try:
-        inputs = processor.apply_chat_template(
-            messages,
-            enable_thinking=GEMMA_ENABLE_THINKING,
-            **template_kwargs,
-        )
-    except TypeError:
-        inputs = processor.apply_chat_template(
-            messages,
-            **template_kwargs,
-        )
-
-    inputs = _move_inputs_to_model(inputs, model)
-    input_len = inputs["input_ids"].shape[-1]
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=GEMMA_MAX_NEW_TOKENS,
-            do_sample=False,
-        )
-
-    response = processor.decode(
-        outputs[0][input_len:],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-
-    text = _gemma_response_to_text(processor, response)
-
-    del inputs, outputs
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return normalize_qwen_data(extract_json(text))
-
-
-def _gemma_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
-    # Gemma 4 12B is much heavier than Qwen2.5-VL-3B, so keep this sequential
-    # unless you validate batch inference on your exact GPU.
-    results = []
-    for path in image_paths:
-        results.append(_gemma_describe_one(path))
-    return results
-
-
-def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
-    """
-    Backward-compatible name. The DB fields are still qwen_*,
-    but IMAGE_TEXT_MODEL_PROVIDER can now be qwen or gemma.
-    """
-    print(
-        f"Image-to-text provider={IMAGE_TEXT_MODEL_PROVIDER}, images={len(image_paths)}",
-        flush=True,
-    )
-
-    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
-        return _gemma_describe_batch_impl(image_paths)
-
-    return _qwen_describe_batch_impl(image_paths)
 
 def get_label_to_id(album_ctx: Dict[str, Any]) -> Dict[str, str]:
     people = db_all("""
@@ -2722,7 +3146,7 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
     fail = 0
     errors = []
 
-    for batch in chunks(rows, image_text_inference_batch_size()):
+    for batch in chunks(rows, QWEN_INFERENCE_BATCH_SIZE):
         prepared = []
 
         for photo in batch:
@@ -2778,9 +3202,8 @@ def load_text_embed_model():
         return _TEXT_EMBED_MODEL
 
     from sentence_transformers import SentenceTransformer
-    device = assert_torch_gpu_ready("Text embeddings")
-    _TEXT_EMBED_MODEL = SentenceTransformer(TEXT_EMBED_MODEL_ID, device=str(device))
-    print(f"Text embedding model loaded: {TEXT_EMBED_MODEL_ID} on {device}", flush=True)
+    _TEXT_EMBED_MODEL = SentenceTransformer(TEXT_EMBED_MODEL_ID)
+    print(f"Text embedding model loaded: {TEXT_EMBED_MODEL_ID}", flush=True)
     return _TEXT_EMBED_MODEL
 
 
@@ -3379,12 +3802,13 @@ def load_image_embed_model():
     if _IMAGE_EMBED_MODEL is not None and _IMAGE_EMBED_PROCESSOR is not None:
         return _IMAGE_EMBED_MODEL, _IMAGE_EMBED_PROCESSOR
 
+    import torch
     from transformers import CLIPModel, CLIPProcessor
 
     print(f"Loading image embedding model: {IMAGE_EMBED_MODEL_ID}", flush=True)
     processor = CLIPProcessor.from_pretrained(IMAGE_EMBED_MODEL_ID)
     model = CLIPModel.from_pretrained(IMAGE_EMBED_MODEL_ID)
-    device = assert_torch_gpu_ready("Image embeddings")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
     _IMAGE_EMBED_MODEL = model
@@ -3826,47 +4250,177 @@ def process_culling_mode(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
 
     raise ValueError(f"Unsupported culling mode: {mode}")
 
+
 # ============================================================
-# MAIN PIPELINE
+# QWEN ENQUEUE FOR SPLIT WORKER
 # ============================================================
 
-def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
-    if payload.get("full_mode", False) or payload.get("qwen_full_mode", False):
-        return {
-            "ingest": False,
-            "compress": False,
-            "face_index": False,
-            "safe_people_reconcile": False,
-            "rebuild_people": False,
-            "qwen": True,
-            "embeddings": True,
-            "culling": bool(payload.get("culling_enabled", payload.get("run_culling", True))),
-            "cleanup_temp": bool(payload.get("cleanup_temp", False)),
-        }
+def _qwen_run_url() -> str:
+    if QWEN_RUN_URL:
+        return QWEN_RUN_URL
+    if QWEN_ENDPOINT_ID:
+        return f"https://api.runpod.ai/v2/{QWEN_ENDPOINT_ID}/run"
+    raise RuntimeError("Missing QWEN_RUN_URL or QWEN_ENDPOINT_ID")
 
-    default_steps = {
+
+def build_qwen_payload_after_face(payload: Dict[str, Any]) -> Dict[str, Any]:
+    supplied_steps = payload.get("steps") or {}
+    full_mode = bool(payload.get("full_mode", False))
+
+    run_qwen = bool(
+        full_mode
+        or supplied_steps.get("enqueue_qwen", False)
+        or supplied_steps.get("qwen", False)
+        or payload.get("enqueue_qwen", False)
+        or payload.get("run_qwen", False)
+    )
+
+    run_embeddings = bool(
+        payload.get("run_embeddings", supplied_steps.get("embeddings", True if run_qwen else False))
+    )
+
+    if full_mode:
+        run_culling = bool(payload.get("culling_enabled", payload.get("run_culling", True)))
+    else:
+        run_culling = bool(
+            payload.get("culling_enabled", payload.get("run_culling", supplied_steps.get("culling", False)))
+        )
+
+    qwen_steps = payload.get("qwen_steps") or {
         "ingest": False,
         "compress": False,
         "face_index": False,
         "safe_people_reconcile": False,
         "rebuild_people": False,
-        "qwen": True,
-        "embeddings": True,
+        "qwen": run_qwen,
+        "embeddings": run_embeddings,
+        "culling": run_culling,
+        "cleanup_temp": bool(payload.get("cleanup_temp", supplied_steps.get("cleanup_temp", False))),
+    }
+
+    qwen_payload = {
+        **payload,
+        "album_slug": payload["album_slug"],
+        "album_name": payload.get("album_name"),
+        "events": payload["events"],
+        "full_mode": False,
+        "steps": qwen_steps,
+        "triggered_by": "photo-face-worker",
+    }
+
+    qwen_payload.pop("face_full_mode", None)
+    qwen_payload.pop("enqueue_qwen", None)
+    return qwen_payload
+
+
+def enqueue_qwen_after_face(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    if not RUNPOD_API_KEY:
+        raise RuntimeError("RUNPOD_API_KEY missing; cannot enqueue Qwen endpoint")
+
+    qwen_payload = build_qwen_payload_after_face(payload)
+
+    if not qwen_payload.get("steps", {}).get("qwen") and not qwen_payload.get("steps", {}).get("embeddings") and not qwen_payload.get("steps", {}).get("culling"):
+        return {
+            "enqueued": False,
+            "reason": "qwen/embeddings/culling steps are all false",
+            "qwen_payload": qwen_payload,
+        }
+
+    body = json.dumps({"input": qwen_payload}).encode("utf-8")
+    url = _qwen_run_url()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RUNPOD_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Qwen enqueue failed HTTP {e.code}: {raw}") from e
+
+    print("Qwen enqueued:", data, flush=True)
+    return {
+        "enqueued": True,
+        "run_url": url,
+        "qwen_job": data,
+        "qwen_payload": qwen_payload,
+    }
+
+
+def forward_culling_mode_to_qwen(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    if not RUNPOD_API_KEY:
+        raise RuntimeError("RUNPOD_API_KEY missing; cannot forward culling mode to Qwen endpoint")
+
+    body = json.dumps({"input": payload}).encode("utf-8")
+    url = _qwen_run_url()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RUNPOD_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Qwen forward failed HTTP {e.code}: {raw}") from e
+
+    return {"forwarded": True, "run_url": url, "qwen_job": data}
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
+    if payload.get("full_mode", False) or payload.get("face_full_mode", False):
+        return {
+            "ingest": True,
+            "compress": True,
+            "face_index": True,
+            "safe_people_reconcile": True,
+            "rebuild_people": False,
+            "qwen": False,
+            "embeddings": False,
+            "culling": False,
+            "cleanup_temp": False,
+            "enqueue_qwen": True,
+        }
+
+    default_steps = {
+        "ingest": True,
+        "compress": False,
+        "face_index": False,
+        "safe_people_reconcile": False,
+        "rebuild_people": False,
+        "qwen": False,
+        "embeddings": False,
         "culling": False,
         "cleanup_temp": False,
+        "enqueue_qwen": False,
     }
 
     supplied = payload.get("steps")
     if supplied:
-        merged = {**default_steps, **supplied}
-        merged["ingest"] = False
-        merged["compress"] = False
-        merged["face_index"] = False
-        merged["safe_people_reconcile"] = False
-        merged["rebuild_people"] = False
-        if payload.get("culling_enabled") is not None or payload.get("run_culling") is not None:
-            merged["culling"] = bool(payload.get("culling_enabled", payload.get("run_culling")))
-        return merged
+        return {**default_steps, **supplied}
 
     return default_steps
 
@@ -3887,7 +4441,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         raise RuntimeError(
             "Blocked: destructive rebuild_people is not allowed. "
             "This protects manually renamed people. "
-            "Use safe_people_reconcile=true in the Face worker instead."
+            "Use safe_people_reconcile=true instead."
         )
 
     update_job_status(job_id, "running", "restore_album", "Restoring album context")
@@ -3902,38 +4456,35 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         "steps": {},
     }
 
-    if steps.get("qwen", False):
-        update_job_status(job_id, "running", "qwen", "Running Qwen metadata")
-        results["steps"]["qwen"] = run_qwen_for_events(album_ctx, db_events)
+    if steps.get("ingest", True):
+        update_job_status(job_id, "running", "ingest", "Scanning S3 and ingesting photos")
+        results["steps"]["ingest"] = scan_and_ingest_originals(album_ctx, db_events)
 
-    if steps.get("embeddings", False):
-        update_job_status(job_id, "running", "embeddings", "Generating text embeddings")
-        results["steps"]["embeddings"] = run_text_embeddings_for_events(album_ctx, db_events)
+        update_job_status(job_id, "running", "s3_validation", "Validating S3 source objects")
+        results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
 
-    if steps.get("culling", False):
-        culling_payload = {
-            **payload,
-            "album_slug": album_slug,
-            "album_type": payload.get("album_type") or album_ctx.get("album_type") or "general",
-            "persona_key": payload.get("persona_key") or payload.get("album_type") or album_ctx.get("album_type") or "general",
-            "limit": int(payload.get("best_photo_count") or payload.get("limit") or payload.get("requested_count") or 100),
-            "requested_count": int(payload.get("best_photo_count") or payload.get("limit") or payload.get("requested_count") or 100),
-            "score_limit": int(payload.get("score_limit") or payload.get("culling_score_limit") or 5000),
-            "embed_limit": int(payload.get("embed_limit") or payload.get("culling_embed_limit") or 5000),
-            "only_unscored": bool(payload.get("only_unscored", False)),
-            "only_missing": bool(payload.get("only_missing", False)),
-        }
-        update_job_status(job_id, "running", "best_photos_full", "Scoring, embedding, clustering, and selecting best photos")
-        results["steps"]["best_photos_full"] = best_photos_full(job_id, culling_payload)
+    if steps.get("compress", False):
+        update_job_status(job_id, "running", "compress", "Generating AI input images")
+        results["steps"]["compress"] = compress_events(album_ctx, db_events)
 
-    if steps.get("cleanup_temp", False):
-        update_job_status(job_id, "running", "cleanup_temp", "Deleting temporary AI folders")
-        results["steps"]["cleanup_temp"] = cleanup_temp_s3(album_ctx, db_events)
+    if steps.get("face_index", False):
+        update_job_status(job_id, "running", "face_index", "Running InsightFace detection/recognition on GPU")
+        results["steps"]["face_index"] = face_index_events(album_ctx, db_events)
 
-    update_job_status(job_id, "running", "final_verify", "Verifying final counts")
-    results["final_verify"] = final_verify(album_ctx, db_events)
+    if steps.get("safe_people_reconcile", False):
+        update_job_status(
+            job_id,
+            "running",
+            "safe_people_reconcile",
+            "Assigning new faces without deleting existing people/names"
+        )
+        results["steps"]["safe_people_reconcile"] = safe_add_new_people_without_touching_existing_names(album_ctx)
 
-    update_job_status(job_id, "completed", "done", "Qwen worker completed")
+    if steps.get("enqueue_qwen", False):
+        update_job_status(job_id, "running", "enqueue_qwen", "Enqueuing Qwen endpoint")
+        results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(payload)
+
+    update_job_status(job_id, "completed", "face_worker", "Face worker completed")
     return results
 
 # ============================================================
@@ -3947,37 +4498,27 @@ def handler(event):
     payload = event.get("input", {})
 
     try:
-        print("Qwen Worker Start", flush=True)
+        print("Face Worker Start", flush=True)
         print("job_id:", job_id, flush=True)
         print("payload:", payload, flush=True)
 
-        if payload.get("debug_clear_qwen_cache"):
-            targets = [
-                "/runpod-volume/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct",
-                "/runpod-volume/huggingface/models--Qwen--Qwen2.5-VL-3B-Instruct",
-                "/models/huggingface/models--Qwen--Qwen2.5-VL-3B-Instruct",
-                "/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct"
-            ]
-            deleted = []
-            for t in targets:
-                if os.path.exists(t):
-                    shutil.rmtree(t, ignore_errors=True)
-                    deleted.append(t)
-            return {"ok": True, "deleted": deleted}
-
         if payload.get("debug_gpu"):
             import torch
+            import onnxruntime as ort
             return {
                 "ok": True,
                 "job_id": job_id,
                 "debug_gpu": {
-                    "strict_qwen_gpu": STRICT_QWEN_GPU,
+                    "strict_face_gpu": STRICT_FACE_GPU,
                     "torch": torch.__version__,
                     "torch_cuda": torch.version.cuda,
                     "torch_cuda_available": torch.cuda.is_available(),
                     "torch_device_count": torch.cuda.device_count(),
                     "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-                    "cudnn": torch.backends.cudnn.version(),
+                    "onnxruntime": ort.__version__,
+                    "onnxruntime_device": ort.get_device(),
+                    "onnxruntime_providers": ort.get_available_providers(),
+                    "insightface_allowed_modules": INSIGHTFACE_ALLOWED_MODULES,
                 },
             }
 
@@ -4012,10 +4553,8 @@ def handler(event):
             "select_best_photos",
             "best_photos_full",
         }
-
         if payload.get("mode") in culling_modes:
-            result = process_culling_mode(job_id, payload)
-            update_job_status(job_id, "completed", payload.get("mode"), "Culling mode completed")
+            result = forward_culling_mode_to_qwen(payload)
         else:
             result = process_album_events(job_id, payload)
 
@@ -4032,7 +4571,7 @@ def handler(event):
             "traceback": traceback.format_exc(),
         }
 
-        print("Qwen worker failed:", err, flush=True)
+        print("Face worker failed:", err, flush=True)
         update_job_status(job_id, "failed", "error", repr(e), err)
 
         return {
@@ -4043,12 +4582,6 @@ def handler(event):
         }
     finally:
         gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
