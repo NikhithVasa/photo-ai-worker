@@ -8,7 +8,8 @@ pillow
 opencv-python-headless
 tqdm
 
-transformers==4.51.3
+# Gemma 4 needs a recent Transformers build. 4.51.3 is too old for Gemma 4.
+transformers>=5.10.1
 accelerate
 safetensors
 sentencepiece
@@ -17,3 +18,7 @@ qwen-vl-utils
 json-repair
 sentence-transformers
 huggingface-hub
+hf_transfer
+
+# Needed for GEMMA_QUANTIZATION=4bit or 8bit
+bitsandbytes
