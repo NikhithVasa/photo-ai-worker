@@ -9,6 +9,9 @@ ENV CUDNN_FRONTEND_ATTN_DISABLED=1
 ENV CUDA_MODULE_LOADING=LAZY
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV TOKENIZERS_PARALLELISM=false
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
@@ -24,6 +27,32 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN python -m pip install -r /app/requirements.txt
+
+RUN python - <<'PY'
+import torch
+import transformers
+from transformers import AutoProcessor
+
+print('torch:', torch.__version__)
+print('torch cuda:', torch.version.cuda)
+print('transformers:', transformers.__version__)
+
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+    print('Qwen2_5_VLForConditionalGeneration import OK')
+except Exception as e:
+    raise SystemExit(f'Qwen import failed: {e}')
+
+try:
+    from transformers import AutoModelForMultimodalLM
+    print('AutoModelForMultimodalLM import OK')
+except Exception as e:
+    try:
+        from transformers import AutoModelForImageTextToText
+        print('AutoModelForImageTextToText import OK')
+    except Exception as e2:
+        raise SystemExit(f'Gemma model class import failed: {e}; fallback failed: {e2}')
+PY
 
 ENV HF_HOME=/runpod-volume/huggingface
 ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface
@@ -58,6 +87,21 @@ from sentence_transformers import SentenceTransformer
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 print('Downloaded sentence-transformers/all-MiniLM-L6-v2')
 PY
+
+# Optional Gemma preload.
+# Building with PRELOAD_GEMMA=true will make the image much larger.
+# Use --build-arg HF_TOKEN=... only if Hugging Face requires authentication for your account/model access.
+ARG PRELOAD_GEMMA=false
+ARG HF_TOKEN=""
+RUN if [ "$PRELOAD_GEMMA" = "true" ]; then \
+      python - <<'PY' ; \
+import os
+from huggingface_hub import snapshot_download
+token = os.environ.get("HF_TOKEN") or None
+snapshot_download("google/gemma-4-12B-it", token=token)
+print("Downloaded google/gemma-4-12B-it")
+PY
+    fi
 
 COPY handler.py /app/handler.py
 CMD ["python", "-u", "/app/handler.py"]
