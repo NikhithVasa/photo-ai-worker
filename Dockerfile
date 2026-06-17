@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
+
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN python -m pip install -r /app/requirements.txt
 
@@ -75,7 +76,7 @@ print('device count at build:', torch.cuda.device_count())
 print('cudnn:', torch.backends.cudnn.version())
 PY
 
-# Download model weights into the image cache without trying to load the model into RAM during build.
+# Download Qwen model weights into image cache without loading model into GPU/RAM.
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download('Qwen/Qwen2.5-VL-3B-Instruct')
@@ -89,19 +90,34 @@ print('Downloaded sentence-transformers/all-MiniLM-L6-v2')
 PY
 
 # Optional Gemma preload.
-# Building with PRELOAD_GEMMA=true will make the image much larger.
-# Use --build-arg HF_TOKEN=... only if Hugging Face requires authentication for your account/model access.
+# Build with:
+# docker build --build-arg PRELOAD_GEMMA=true --build-arg HF_TOKEN=xxx .
+#
+# But I recommend keeping PRELOAD_GEMMA=false first because Gemma 12B will make the image huge.
 ARG PRELOAD_GEMMA=false
 ARG HF_TOKEN=""
-RUN if [ "$PRELOAD_GEMMA" = "true" ]; then \
-      python - <<'PY' ; \
+
+RUN <<'SH'
+set -e
+
+if [ "$PRELOAD_GEMMA" = "true" ]; then
+  export HF_TOKEN="${HF_TOKEN}"
+
+  python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
+
 token = os.environ.get("HF_TOKEN") or None
 snapshot_download("google/gemma-4-12B-it", token=token)
+
 print("Downloaded google/gemma-4-12B-it")
 PY
-    fi
+
+else
+  echo "Skipping Gemma preload because PRELOAD_GEMMA is not true"
+fi
+SH
 
 COPY handler.py /app/handler.py
+
 CMD ["python", "-u", "/app/handler.py"]
