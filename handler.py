@@ -10,6 +10,11 @@ import shutil
 import traceback
 import tempfile
 import subprocess
+import threading
+import faulthandler
+import signal
+import atexit
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -60,6 +65,15 @@ FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "3
 PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTING_SIM_THRESHOLD", "0.58"))
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
+
+# Safe reconcile debug / guardrails.
+# Keep optional work disabled while debugging because RunPod can hard-kill
+# the worker without a Python traceback if memory spikes.
+SAFE_RECONCILE_CROP_COVERS = os.environ.get("SAFE_RECONCILE_CROP_COVERS", "false").lower() == "true"
+SAFE_RECONCILE_DUP_CANDIDATES = os.environ.get("SAFE_RECONCILE_DUP_CANDIDATES", "false").lower() == "true"
+SAFE_RECONCILE_MEMORY_HEARTBEAT_SECONDS = int(os.environ.get("SAFE_RECONCILE_MEMORY_HEARTBEAT_SECONDS", "10"))
+SAFE_RECONCILE_MAX_UNLABELED_FACES = int(os.environ.get("SAFE_RECONCILE_MAX_UNLABELED_FACES", "5000"))
+
 
 # Image-to-text provider settings
 # Keep "qwen" for current behavior. Set "gemma" to use Gemma 4 12B.
@@ -152,6 +166,100 @@ DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "3"))
 DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "8"))
 DB_CONNECT_BASE_SLEEP = float(os.environ.get("DB_CONNECT_BASE_SLEEP", "0.75"))
 DB_APPLICATION_NAME = os.environ.get("DB_APPLICATION_NAME", "photo_ai_worker")
+
+
+# ============================================================
+# PROCESS / MEMORY DEBUG HELPERS
+# ============================================================
+
+def install_process_debug_handlers() -> None:
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception as e:
+        print(f"[PROCESS] faulthandler enable failed: {repr(e)}", flush=True)
+
+    print(f"[PROCESS] pid={os.getpid()} starting", flush=True)
+
+    def _on_exit():
+        print(f"[PROCESS] pid={os.getpid()} exiting via atexit", flush=True)
+
+    try:
+        atexit.register(_on_exit)
+    except Exception:
+        pass
+
+    def _handle_signal(signum, frame):
+        print(f"[PROCESS] received signal={signum}", flush=True)
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+
+    for _sig in [signal.SIGTERM, signal.SIGINT]:
+        try:
+            signal.signal(_sig, _handle_signal)
+        except Exception:
+            pass
+
+
+def _read_proc_status_kb(field: str) -> int:
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    parts = line.split()
+                    return int(parts[1])
+    except Exception:
+        return -1
+    return -1
+
+
+def log_memory(tag: str) -> None:
+    rss_kb = _read_proc_status_kb("VmRSS")
+    hwm_kb = _read_proc_status_kb("VmHWM")
+    size_kb = _read_proc_status_kb("VmSize")
+
+    print(
+        f"[MEM] {tag} "
+        f"rss_mb={rss_kb / 1024:.1f} "
+        f"peak_rss_mb={hwm_kb / 1024:.1f} "
+        f"vmsize_mb={size_kb / 1024:.1f}",
+        flush=True,
+    )
+
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.STDOUT,
+            timeout=5,
+            text=True,
+        ).strip()
+
+        print(f"[GPU_MEM] {tag} {out}", flush=True)
+    except Exception as e:
+        print(f"[GPU_MEM] {tag} unavailable: {repr(e)}", flush=True)
+
+
+def start_memory_heartbeat(label: str, every_seconds: int = 10):
+    stop_event = threading.Event()
+
+    def _loop():
+        i = 0
+        while not stop_event.is_set():
+            log_memory(f"{label} heartbeat={i}")
+            i += 1
+            stop_event.wait(every_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return stop_event
+
+
+install_process_debug_handlers()
 
 
 # ============================================================
@@ -1312,227 +1420,368 @@ class DSU:
 
 
 def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assign only currently-unlabeled faces to existing/new people.
+
+    Debug/guardrail version:
+    - Emits memory + GPU memory logs around every expensive section.
+    - Adds a heartbeat while the function is running.
+    - Skips optional cover-crop and duplicate-candidate generation by default.
+    - Prevents optional maintenance work from blocking downstream image-text work.
+    """
     album_id = album_ctx["album_id"]
 
-    face_rows = db_all("""
-        SELECT
-            f.id,
-            f.album_id,
-            f.album_event_id,
-            f.photo_id,
-            f.embedding,
-            f.face_quality_score,
-            f.detection_confidence
-        FROM faces f
-        WHERE f.album_id = %s::uuid
-          AND f.person_id IS NULL
-        ORDER BY f.face_quality_score DESC NULLS LAST, f.created_at;
-    """, (album_id,))
-
-    if not face_rows:
-        rebuild_photo_people_base_safe(album_ctx)
-        return {
-            "unlabeled_faces": 0,
-            "assigned_to_existing_people": 0,
-            "new_people_created": 0,
-            "message": "No unlabeled faces found. Existing people untouched.",
-        }
-
-    existing_people = db_all("""
-        SELECT
-            id,
-            person_number,
-            display_name,
-            default_name,
-            centroid_embedding
-        FROM people
-        WHERE album_id = %s::uuid
-          AND COALESCE(is_hidden, false) = false
-          AND centroid_embedding IS NOT NULL
-        ORDER BY person_number;
-    """, (album_id,))
-
-    face_vecs = [parse_pg_vector(r["embedding"]) for r in face_rows]
-
-    assigned_to_existing = []
-    remaining_indices = list(range(len(face_rows)))
-
-    if existing_people:
-        people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
-        P = np.stack(people_vecs).astype(np.float32)
-        F = np.stack(face_vecs).astype(np.float32)
-
-        sims = F @ P.T
-        best_people_idx = sims.argmax(axis=1)
-        best_scores = sims.max(axis=1)
-
-        still_remaining = []
-
-        for i, score in enumerate(best_scores):
-            if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
-                person = existing_people[int(best_people_idx[i])]
-                assigned_to_existing.append((str(person["id"]), str(face_rows[i]["id"])))
-            else:
-                still_remaining.append(i)
-
-        remaining_indices = still_remaining
-
-    new_clusters: Dict[int, List[int]] = {}
-
-    if remaining_indices:
-        if len(remaining_indices) == 1:
-            new_clusters[0] = remaining_indices
-        else:
-            X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
-            sims = X @ X.T
-            dsu = DSU(len(remaining_indices))
-
-            for i in range(len(remaining_indices)):
-                for j in range(i + 1, len(remaining_indices)):
-                    if float(sims[i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
-                        dsu.union(i, j)
-
-            temp: Dict[int, List[int]] = {}
-            for local_i, original_i in enumerate(remaining_indices):
-                root = dsu.find(local_i)
-                temp.setdefault(root, []).append(original_i)
-
-            new_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
-
-    conn = get_conn()
-    new_people_created = 0
+    print("[SAFE_RECONCILE] start", flush=True)
+    log_memory("safe_reconcile_start")
+    heartbeat_stop = start_memory_heartbeat(
+        "safe_reconcile",
+        every_seconds=max(1, SAFE_RECONCILE_MEMORY_HEARTBEAT_SECONDS),
+    )
 
     try:
-        with conn:
-            with conn.cursor() as cur:
-                if assigned_to_existing:
-                    execute_values(
-                        cur,
-                        """
-                        UPDATE faces AS f
-                        SET person_id = v.person_id::uuid
-                        FROM (VALUES %s) AS v(person_id, face_id)
-                        WHERE f.id = v.face_id::uuid;
-                        """,
-                        assigned_to_existing,
-                        template="(%s, %s)"
-                    )
+        print("[SAFE_RECONCILE] load unlabeled faces start", flush=True)
+        log_memory("before_load_unlabeled_faces")
 
-                cur.execute("""
-                    SELECT COALESCE(MAX(person_number), 0) AS max_num
-                    FROM people
-                    WHERE album_id = %s::uuid;
-                """, (album_id,))
-                next_num = int(cur.fetchone()["max_num"] or 0) + 1
+        face_rows = db_all("""
+            SELECT
+                f.id,
+                f.album_id,
+                f.album_event_id,
+                f.photo_id,
+                f.embedding,
+                f.face_quality_score,
+                f.detection_confidence
+            FROM faces f
+            WHERE f.album_id = %s::uuid
+              AND f.person_id IS NULL
+            ORDER BY f.face_quality_score DESC NULLS LAST, f.created_at;
+        """, (album_id,))
 
-                for _, face_indices in new_clusters.items():
-                    group_faces = [face_rows[i] for i in face_indices]
-                    group_vecs = [face_vecs[i] for i in face_indices]
+        print(f"[SAFE_RECONCILE] unlabeled_faces={len(face_rows)}", flush=True)
+        log_memory("after_load_unlabeled_faces")
 
-                    centroid = mean_normalized(group_vecs)
-                    best_face = sorted(
-                        group_faces,
-                        key=lambda r: float(r.get("face_quality_score") or 0),
-                        reverse=True,
-                    )[0]
+        if len(face_rows) > SAFE_RECONCILE_MAX_UNLABELED_FACES:
+            raise RuntimeError(
+                f"Too many unlabeled faces for one reconcile run: {len(face_rows)}. "
+                f"SAFE_RECONCILE_MAX_UNLABELED_FACES={SAFE_RECONCILE_MAX_UNLABELED_FACES}. "
+                "Increase the env var or split reconcile into smaller event/batch jobs."
+            )
 
-                    default_name = f"Person {next_num}"
+        if not face_rows:
+            print("[SAFE_RECONCILE] no unlabeled faces; rebuild_photo_people start", flush=True)
+            photo_people_result = rebuild_photo_people_base_safe(album_ctx)
+            print(f"[SAFE_RECONCILE] no unlabeled faces; rebuild_photo_people done: {photo_people_result}", flush=True)
+
+            result = {
+                "unlabeled_faces": 0,
+                "assigned_to_existing_people": 0,
+                "new_people_created": 0,
+                "photo_people": photo_people_result,
+                "message": "No unlabeled faces found. Existing people untouched.",
+            }
+
+            print(f"[SAFE_RECONCILE] done: {result}", flush=True)
+            log_memory("safe_reconcile_done_no_unlabeled")
+            return result
+
+        print("[SAFE_RECONCILE] load existing people start", flush=True)
+        log_memory("before_load_existing_people")
+
+        existing_people = db_all("""
+            SELECT
+                id,
+                person_number,
+                display_name,
+                default_name,
+                centroid_embedding
+            FROM people
+            WHERE album_id = %s::uuid
+              AND COALESCE(is_hidden, false) = false
+              AND centroid_embedding IS NOT NULL
+            ORDER BY person_number;
+        """, (album_id,))
+
+        print(f"[SAFE_RECONCILE] existing_people={len(existing_people)}", flush=True)
+        log_memory("after_load_existing_people")
+
+        print("[SAFE_RECONCILE] parse face vectors start", flush=True)
+        face_vecs = [parse_pg_vector(r["embedding"]) for r in face_rows]
+        print(f"[SAFE_RECONCILE] face_vecs={len(face_vecs)}", flush=True)
+        log_memory("after_parse_face_vectors")
+
+        assigned_to_existing = []
+        remaining_indices = list(range(len(face_rows)))
+
+        if existing_people:
+            print("[SAFE_RECONCILE] existing similarity match start", flush=True)
+            log_memory("before_existing_similarity")
+
+            people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
+            P = np.stack(people_vecs).astype(np.float32)
+            F = np.stack(face_vecs).astype(np.float32)
+
+            print(f"[SAFE_RECONCILE] existing similarity shapes F={F.shape} P={P.shape}", flush=True)
+
+            sims = F @ P.T
+            best_people_idx = sims.argmax(axis=1)
+            best_scores = sims.max(axis=1)
+
+            still_remaining = []
+
+            for i, score in enumerate(best_scores):
+                if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
+                    person = existing_people[int(best_people_idx[i])]
+                    assigned_to_existing.append((str(person["id"]), str(face_rows[i]["id"])))
+                else:
+                    still_remaining.append(i)
+
+            remaining_indices = still_remaining
+
+            del P, F, sims, best_people_idx, best_scores
+            gc.collect()
+
+            print(
+                f"[SAFE_RECONCILE] existing similarity done assigned_existing={len(assigned_to_existing)} "
+                f"remaining={len(remaining_indices)}",
+                flush=True,
+            )
+            log_memory("after_existing_similarity")
+
+        new_clusters: Dict[int, List[int]] = {}
+
+        if remaining_indices:
+            print(f"[SAFE_RECONCILE] new clustering start remaining={len(remaining_indices)}", flush=True)
+            log_memory("before_new_clustering")
+
+            if len(remaining_indices) == 1:
+                new_clusters[0] = remaining_indices
+            else:
+                X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
+                print(f"[SAFE_RECONCILE] new clustering matrix X={X.shape}", flush=True)
+                log_memory("before_new_similarity_matrix")
+
+                sims = X @ X.T
+                print(f"[SAFE_RECONCILE] new clustering similarity matrix shape={sims.shape}", flush=True)
+                log_memory("after_new_similarity_matrix")
+
+                dsu = DSU(len(remaining_indices))
+
+                for i in range(len(remaining_indices)):
+                    if i > 0 and i % 250 == 0:
+                        print(f"[SAFE_RECONCILE] new clustering progress i={i}/{len(remaining_indices)}", flush=True)
+                        log_memory(f"new_clustering_progress_{i}")
+
+                    for j in range(i + 1, len(remaining_indices)):
+                        if float(sims[i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
+                            dsu.union(i, j)
+
+                temp: Dict[int, List[int]] = {}
+                for local_i, original_i in enumerate(remaining_indices):
+                    root = dsu.find(local_i)
+                    temp.setdefault(root, []).append(original_i)
+
+                new_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
+
+                del X, sims
+                gc.collect()
+
+            print(f"[SAFE_RECONCILE] new clustering done new_clusters={len(new_clusters)}", flush=True)
+            log_memory("after_new_clustering")
+
+        print(
+            f"[SAFE_RECONCILE] db write start assigned_existing={len(assigned_to_existing)} "
+            f"new_clusters={len(new_clusters)}",
+            flush=True,
+        )
+        log_memory("before_db_write")
+
+        conn = get_conn()
+        new_people_created = 0
+
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    if assigned_to_existing:
+                        print(f"[SAFE_RECONCILE] updating existing face assignments count={len(assigned_to_existing)}", flush=True)
+                        execute_values(
+                            cur,
+                            """
+                            UPDATE faces AS f
+                            SET person_id = v.person_id::uuid
+                            FROM (VALUES %s) AS v(person_id, face_id)
+                            WHERE f.id = v.face_id::uuid;
+                            """,
+                            assigned_to_existing,
+                            template="(%s, %s)"
+                        )
 
                     cur.execute("""
-                        INSERT INTO people(
+                        SELECT COALESCE(MAX(person_number), 0) AS max_num
+                        FROM people
+                        WHERE album_id = %s::uuid;
+                    """, (album_id,))
+                    next_num = int(cur.fetchone()["max_num"] or 0) + 1
+
+                    for cluster_idx, face_indices in new_clusters.items():
+                        if cluster_idx > 0 and cluster_idx % 100 == 0:
+                            print(
+                                f"[SAFE_RECONCILE] creating people progress cluster={cluster_idx}/{len(new_clusters)} "
+                                f"created={new_people_created}",
+                                flush=True,
+                            )
+                            log_memory(f"db_write_cluster_{cluster_idx}")
+
+                        group_faces = [face_rows[i] for i in face_indices]
+                        group_vecs = [face_vecs[i] for i in face_indices]
+
+                        centroid = mean_normalized(group_vecs)
+                        best_face = sorted(
+                            group_faces,
+                            key=lambda r: float(r.get("face_quality_score") or 0),
+                            reverse=True,
+                        )[0]
+
+                        default_name = f"Person {next_num}"
+
+                        cur.execute("""
+                            INSERT INTO people(
+                                album_id,
+                                person_number,
+                                default_name,
+                                display_name,
+                                cover_photo_id,
+                                centroid_embedding,
+                                face_count,
+                                photo_count,
+                                occurrence_count,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (
+                                %s::uuid,
+                                %s,
+                                %s,
+                                %s,
+                                %s::uuid,
+                                %s::vector,
+                                %s,
+                                %s,
+                                %s,
+                                now(),
+                                now()
+                            )
+                            RETURNING id;
+                        """, (
                             album_id,
-                            person_number,
+                            next_num,
                             default_name,
-                            display_name,
-                            cover_photo_id,
-                            centroid_embedding,
-                            face_count,
-                            photo_count,
-                            occurrence_count,
-                            created_at,
-                            updated_at
+                            default_name,
+                            str(best_face["photo_id"]),
+                            vector_to_pg(centroid),
+                            len(group_faces),
+                            len(set(str(f["photo_id"]) for f in group_faces)),
+                            len(set(str(f["photo_id"]) for f in group_faces)),
+                        ))
+
+                        person_id = str(cur.fetchone()["id"])
+                        face_update_rows = [(person_id, str(f["id"])) for f in group_faces]
+
+                        execute_values(
+                            cur,
+                            """
+                            UPDATE faces AS f
+                            SET person_id = v.person_id::uuid
+                            FROM (VALUES %s) AS v(person_id, face_id)
+                            WHERE f.id = v.face_id::uuid;
+                            """,
+                            face_update_rows,
+                            template="(%s, %s)"
                         )
-                        VALUES (
-                            %s::uuid,
-                            %s,
-                            %s,
-                            %s,
-                            %s::uuid,
-                            %s::vector,
-                            %s,
-                            %s,
-                            %s,
-                            now(),
-                            now()
+
+                        next_num += 1
+                        new_people_created += 1
+
+                    print("[SAFE_RECONCILE] updating people stats start", flush=True)
+                    cur.execute("""
+                        WITH stats AS (
+                            SELECT
+                                person_id,
+                                COUNT(*) AS face_count,
+                                COUNT(DISTINCT photo_id) AS photo_count
+                            FROM faces
+                            WHERE album_id = %s::uuid
+                              AND person_id IS NOT NULL
+                            GROUP BY person_id
                         )
-                        RETURNING id;
-                    """, (
-                        album_id,
-                        next_num,
-                        default_name,
-                        default_name,
-                        str(best_face["photo_id"]),
-                        vector_to_pg(centroid),
-                        len(group_faces),
-                        len(set(str(f["photo_id"]) for f in group_faces)),
-                        len(set(str(f["photo_id"]) for f in group_faces)),
-                    ))
+                        UPDATE people p
+                        SET
+                            face_count = stats.face_count,
+                            photo_count = stats.photo_count,
+                            occurrence_count = stats.photo_count,
+                            updated_at = now()
+                        FROM stats
+                        WHERE p.id = stats.person_id
+                          AND p.album_id = %s::uuid;
+                    """, (album_id, album_id))
 
-                    person_id = str(cur.fetchone()["id"])
+        finally:
+            conn.close()
 
-                    face_update_rows = [(person_id, str(f["id"])) for f in group_faces]
+        print("[SAFE_RECONCILE] db write done", flush=True)
+        log_memory("after_db_write")
 
-                    execute_values(
-                        cur,
-                        """
-                        UPDATE faces AS f
-                        SET person_id = v.person_id::uuid
-                        FROM (VALUES %s) AS v(person_id, face_id)
-                        WHERE f.id = v.face_id::uuid;
-                        """,
-                        face_update_rows,
-                        template="(%s, %s)"
-                    )
+        unlabeled_faces_count = len(face_rows)
+        assigned_existing_count = len(assigned_to_existing)
 
-                    next_num += 1
-                    new_people_created += 1
+        try:
+            del face_vecs
+            del face_rows
+        except Exception:
+            pass
 
-                cur.execute("""
-                    WITH stats AS (
-                        SELECT
-                            person_id,
-                            COUNT(*) AS face_count,
-                            COUNT(DISTINCT photo_id) AS photo_count
-                        FROM faces
-                        WHERE album_id = %s::uuid
-                          AND person_id IS NOT NULL
-                        GROUP BY person_id
-                    )
-                    UPDATE people p
-                    SET
-                        face_count = stats.face_count,
-                        photo_count = stats.photo_count,
-                        occurrence_count = stats.photo_count,
-                        updated_at = now()
-                    FROM stats
-                    WHERE p.id = stats.person_id
-                      AND p.album_id = %s::uuid;
-                """, (album_id, album_id))
+        gc.collect()
+        log_memory("after_free_face_arrays")
+
+        print("[SAFE_RECONCILE] rebuild_photo_people start", flush=True)
+        photo_people_result = rebuild_photo_people_base_safe(album_ctx)
+        print(f"[SAFE_RECONCILE] rebuild_photo_people done: {photo_people_result}", flush=True)
+        log_memory("after_rebuild_photo_people")
+
+        cover_result = {"skipped": True, "reason": "SAFE_RECONCILE_CROP_COVERS=false"}
+        if SAFE_RECONCILE_CROP_COVERS:
+            print("[SAFE_RECONCILE] crop covers start", flush=True)
+            cover_result = crop_and_upload_missing_person_covers(album_ctx)
+            print(f"[SAFE_RECONCILE] crop covers done: {cover_result}", flush=True)
+            log_memory("after_crop_covers")
+
+        duplicate_result = {"skipped": True, "reason": "SAFE_RECONCILE_DUP_CANDIDATES=false"}
+        if SAFE_RECONCILE_DUP_CANDIDATES:
+            print("[SAFE_RECONCILE] duplicate candidates start", flush=True)
+            duplicate_result = build_duplicate_candidates(album_ctx)
+            print(f"[SAFE_RECONCILE] duplicate candidates done: {duplicate_result}", flush=True)
+            log_memory("after_duplicate_candidates")
+
+        result = {
+            "unlabeled_faces": unlabeled_faces_count,
+            "assigned_to_existing_people": assigned_existing_count,
+            "new_people_created": new_people_created,
+            "existing_people_untouched": True,
+            "names_preserved": True,
+            "photo_people": photo_people_result,
+            "covers": cover_result,
+            "duplicate_candidates": duplicate_result,
+        }
+
+        print(f"[SAFE_RECONCILE] done: {result}", flush=True)
+        log_memory("safe_reconcile_done")
+        return result
 
     finally:
-        conn.close()
-
-    rebuild_photo_people_base_safe(album_ctx)
-    crop_and_upload_missing_person_covers(album_ctx)
-    build_duplicate_candidates(album_ctx)
-
-    return {
-        "unlabeled_faces": len(face_rows),
-        "assigned_to_existing_people": len(assigned_to_existing),
-        "new_people_created": new_people_created,
-        "existing_people_untouched": True,
-        "names_preserved": True,
-    }
+        try:
+            heartbeat_stop.set()
+        except Exception:
+            pass
+        log_memory("safe_reconcile_finally")
 
 
 def rebuild_photo_people_base_safe(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
