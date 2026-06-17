@@ -4,7 +4,6 @@ psycopg2-binary
 python-dotenv
 
 numpy
-pandas
 pillow
 opencv-python-headless
 tqdm
@@ -16,12 +15,5 @@ sentencepiece
 protobuf
 qwen-vl-utils
 json-repair
-
-insightface==0.7.3
-onnxruntime-gpu==1.20.1
-
-faiss-cpu
-scikit-learn
 sentence-transformers
-rawpy
-ImageHash
+huggingface-hub
