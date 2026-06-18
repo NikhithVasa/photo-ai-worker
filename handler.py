@@ -60,58 +60,41 @@ FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "3
 PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTING_SIM_THRESHOLD", "0.58"))
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
-# Image-to-text provider settings
-# Hard-coded to Gemma. No env fallback.
-IMAGE_TEXT_MODEL_PROVIDER = "gemma"
+# ============================================================
+# IMAGE-TO-TEXT PROVIDER
+# ============================================================
 
-# Qwen settings kept only so old function/DB names don't break.
-# These will not be used when IMAGE_TEXT_MODEL_PROVIDER == "gemma".
-QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
-QWEN_IMAGE_MAX_SIDE = 448
-QWEN_MAX_NEW_TOKENS = 320
-QWEN_INFERENCE_BATCH_SIZE = 4
-
-# Gemma settings
-GEMMA_MODEL_ID = "google/gemma-4-12B-it"
-GEMMA_IMAGE_MAX_SIDE = 448
-GEMMA_MAX_NEW_TOKENS = 320
-GEMMA_INFERENCE_BATCH_SIZE = 1
-GEMMA_QUANTIZATION = "4bit"
-GEMMA_ENABLE_THINKING = False
-GEMMA_ATTN_IMPLEMENTATION = "sdpa"
-GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
-GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", str(QWEN_IMAGE_MAX_SIDE)))
-GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", str(QWEN_MAX_NEW_TOKENS)))
-GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "1"))
-GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
-GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
-GEMMA_ATTN_IMPLEMENTATION = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
-
-# Image-to-text provider settings
-# Keep "qwen" for current behavior. Set "gemma" to use Gemma 4 12B.
+# Default is Gemma.
+# Qwen runs ONLY if you explicitly set one of these environment variables to qwen:
+#   IMAGE_TEXT_MODEL_PROVIDER=qwen
+#   VISION_MODEL_PROVIDER=qwen
+# If neither env var is set, or if either is set to gemma, this worker runs Gemma.
 IMAGE_TEXT_MODEL_PROVIDER = (
     os.environ.get("IMAGE_TEXT_MODEL_PROVIDER")
     or os.environ.get("VISION_MODEL_PROVIDER")
     or "gemma"
 ).strip().lower()
 
-if IMAGE_TEXT_MODEL_PROVIDER not in {"qwen", "gemma"}:
+if IMAGE_TEXT_MODEL_PROVIDER not in {"gemma", "qwen"}:
     raise RuntimeError(
-        "IMAGE_TEXT_MODEL_PROVIDER must be one of: qwen, gemma. "
+        "IMAGE_TEXT_MODEL_PROVIDER must be one of: gemma, qwen. "
         f"Got: {IMAGE_TEXT_MODEL_PROVIDER!r}"
     )
 
-# Qwen settings
+# Qwen settings.
+# These are used ONLY when IMAGE_TEXT_MODEL_PROVIDER == "qwen".
+# DB/status/function names may still say qwen_* for backward compatibility.
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 QWEN_IMAGE_MAX_SIDE = int(os.environ.get("QWEN_IMAGE_MAX_SIDE", "448"))
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "320"))
 QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4"))
 
-# Gemma settings
-# For 24GB GPUs: start with GEMMA_QUANTIZATION=4bit. Try "none" only after a small test.
+# Gemma settings.
+# These are used by default.
+# For 24GB GPUs, keep GEMMA_QUANTIZATION=4bit first.
 GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
-GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", str(QWEN_IMAGE_MAX_SIDE)))
-GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", str(QWEN_MAX_NEW_TOKENS)))
+GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", "448"))
+GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", "320"))
 GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "1"))
 GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
 GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
@@ -2567,18 +2550,25 @@ def _gemma_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
 
 def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
     """
-    Backward-compatible name. The DB fields are still qwen_*,
-    but IMAGE_TEXT_MODEL_PROVIDER can now be qwen or gemma.
+    Backward-compatible function name.
+
+    DB/status fields still say qwen_*, but the actual model is controlled by
+    IMAGE_TEXT_MODEL_PROVIDER.
+
+    Default behavior:
+      - Gemma runs when no provider env var is set.
+      - Gemma runs when IMAGE_TEXT_MODEL_PROVIDER=gemma or VISION_MODEL_PROVIDER=gemma.
+      - Qwen runs ONLY when IMAGE_TEXT_MODEL_PROVIDER=qwen or VISION_MODEL_PROVIDER=qwen.
     """
     print(
         f"Image-to-text provider={IMAGE_TEXT_MODEL_PROVIDER}, images={len(image_paths)}",
         flush=True,
     )
 
-    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
-        return _gemma_describe_batch_impl(image_paths)
+    if IMAGE_TEXT_MODEL_PROVIDER == "qwen":
+        return _qwen_describe_batch_impl(image_paths)
 
-    return _qwen_describe_batch_impl(image_paths)
+    return _gemma_describe_batch_impl(image_paths)
 
 def get_label_to_id(album_ctx: Dict[str, Any]) -> Dict[str, str]:
     people = db_all("""
