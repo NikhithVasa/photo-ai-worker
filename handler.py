@@ -60,13 +60,39 @@ FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "3
 PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTING_SIM_THRESHOLD", "0.58"))
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
+# Image-to-text provider settings
+# Hard-coded to Gemma. No env fallback.
+IMAGE_TEXT_MODEL_PROVIDER = "gemma"
+
+# Qwen settings kept only so old function/DB names don't break.
+# These will not be used when IMAGE_TEXT_MODEL_PROVIDER == "gemma".
+QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+QWEN_IMAGE_MAX_SIDE = 448
+QWEN_MAX_NEW_TOKENS = 320
+QWEN_INFERENCE_BATCH_SIZE = 4
+
+# Gemma settings
+GEMMA_MODEL_ID = "google/gemma-4-12B-it"
+GEMMA_IMAGE_MAX_SIDE = 448
+GEMMA_MAX_NEW_TOKENS = 320
+GEMMA_INFERENCE_BATCH_SIZE = 1
+GEMMA_QUANTIZATION = "4bit"
+GEMMA_ENABLE_THINKING = False
+GEMMA_ATTN_IMPLEMENTATION = "sdpa"
+GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
+GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", str(QWEN_IMAGE_MAX_SIDE)))
+GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", str(QWEN_MAX_NEW_TOKENS)))
+GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "1"))
+GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
+GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
+GEMMA_ATTN_IMPLEMENTATION = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
 
 # Image-to-text provider settings
 # Keep "qwen" for current behavior. Set "gemma" to use Gemma 4 12B.
 IMAGE_TEXT_MODEL_PROVIDER = (
     os.environ.get("IMAGE_TEXT_MODEL_PROVIDER")
     or os.environ.get("VISION_MODEL_PROVIDER")
-    or "qwen"
+    or "gemma"
 ).strip().lower()
 
 if IMAGE_TEXT_MODEL_PROVIDER not in {"qwen", "gemma"}:
