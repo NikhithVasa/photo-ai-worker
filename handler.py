@@ -2468,11 +2468,22 @@ def _model_device_and_dtype(model: Any) -> Tuple[Any, Any]:
     except Exception:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_dtype = getattr(model, "dtype", None)
-    if model_dtype is None:
-        # Gemma on CUDA is fastest/stablest with bf16 activations when supported.
-        model_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    # IMPORTANT:
+    # For bitsandbytes 4-bit models, model.dtype can be torch.uint8 because
+    # quantized weights are stored as bytes. That dtype must NEVER be used for
+    # Gemma pixel/image tensors. LayerNorm requires floating point activations.
+    raw_model_dtype = getattr(model, "dtype", None)
 
+    if raw_model_dtype is not None:
+        try:
+            if torch.empty((), dtype=raw_model_dtype).dtype.is_floating_point:
+                return device, raw_model_dtype
+        except Exception:
+            pass
+
+    # Gemma 4-bit compute dtype is bf16 in load_gemma(); use bf16 activations
+    # on CUDA when available, otherwise fp32.
+    model_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     return device, model_dtype
 
 
@@ -2574,12 +2585,15 @@ def _gemma_messages_for_image(image_path: Path) -> List[Dict[str, Any]]:
 
 
 def _gemma_apply_chat_template(processor: Any, conversations: List[List[Dict[str, Any]]]) -> Any:
+    # Newer Transformers versions warn when processor.__call__ kwargs such as
+    # padding are passed directly through apply_chat_template. Put them under
+    # processor_kwargs when supported.
     template_kwargs: Dict[str, Any] = {
         "tokenize": True,
         "return_dict": True,
         "return_tensors": "pt",
         "add_generation_prompt": True,
-        "padding": True,
+        "processor_kwargs": {"padding": True},
     }
 
     try:
@@ -2589,11 +2603,21 @@ def _gemma_apply_chat_template(processor: Any, conversations: List[List[Dict[str
             **template_kwargs,
         )
     except TypeError:
-        # Some Transformers versions do not accept enable_thinking.
-        return processor.apply_chat_template(
-            conversations,
-            **template_kwargs,
-        )
+        try:
+            # Some Transformers versions do not accept enable_thinking.
+            return processor.apply_chat_template(
+                conversations,
+                **template_kwargs,
+            )
+        except TypeError:
+            # Older Transformers versions do not accept processor_kwargs.
+            legacy_kwargs = dict(template_kwargs)
+            legacy_kwargs.pop("processor_kwargs", None)
+            legacy_kwargs["padding"] = True
+            return processor.apply_chat_template(
+                conversations,
+                **legacy_kwargs,
+            )
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
