@@ -10,10 +10,12 @@ import shutil
 import traceback
 import tempfile
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+from botocore.config import Config
 import cv2
 import numpy as np
 import psycopg2
@@ -50,6 +52,16 @@ RESET_EXISTING_QWEN = os.environ.get("RESET_EXISTING_QWEN", "false").lower() == 
 AI_INPUT_MAX_SIDE = int(os.environ.get("AI_INPUT_MAX_SIDE", "1600"))
 AI_INPUT_WEBP_QUALITY = int(os.environ.get("AI_INPUT_WEBP_QUALITY", "88"))
 
+# Compression parallelism.
+# Compression is S3/network + CPU image encode. GPU is not used here.
+# Keep this conservative if your RDS is small; each worker only touches DB at the end.
+COMPRESS_MAX_WORKERS = int(os.environ.get("COMPRESS_MAX_WORKERS", "6"))
+COMPRESS_LOG_EVERY = int(os.environ.get("COMPRESS_LOG_EVERY", "25"))
+
+# If true, and ai_input_s3_key already exists in S3, mark compression completed without regenerating.
+# For a true full rerun, keep false. For faster retries, set true.
+COMPRESS_REUSE_EXISTING_AI_INPUT = os.environ.get("COMPRESS_REUSE_EXISTING_AI_INPUT", "false").lower() == "true"
+
 # Face settings
 FACE_DET_SIZE = tuple(
     int(x.strip()) for x in os.environ.get("FACE_DET_SIZE", "640,640").split(",")
@@ -60,53 +72,27 @@ FACE_CLUSTER_MIN_FACE_SIDE = int(os.environ.get("FACE_CLUSTER_MIN_FACE_SIDE", "3
 PEOPLE_MATCH_EXISTING_SIM_THRESHOLD = float(os.environ.get("PEOPLE_MATCH_EXISTING_SIM_THRESHOLD", "0.58"))
 NEW_FACE_CLUSTER_SIM_THRESHOLD = float(os.environ.get("NEW_FACE_CLUSTER_SIM_THRESHOLD", "0.62"))
 DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SIM_THRESHOLD", "0.55"))
-# ============================================================
-# IMAGE-TO-TEXT PROVIDER
-# ============================================================
 
-# Gemma-only image-text worker.
-# DB/status/function names still say qwen_* in a few places for backward compatibility
-# with your existing schema, but runtime inference is intentionally Gemma only.
-#
-# Why remove the runtime toggle?
-# - One codepath is easier to stabilize and benchmark.
-# - The previous Qwen/Gemma toggle made batching/dtype handling harder to reason about.
-# - Your current blocker is Gemma; this worker should make Gemma fast and reliable first.
-IMAGE_TEXT_MODEL_PROVIDER = "gemma"
+# Split-worker / GPU strictness settings.
+# Keep strict=true: the worker fails if detector/recognizer are not backed by CUDA.
+STRICT_FACE_GPU = os.environ.get("STRICT_FACE_GPU", "true").lower() == "true"
+INSIGHTFACE_ALLOWED_MODULES = [
+    x.strip()
+    for x in os.environ.get("INSIGHTFACE_ALLOWED_MODULES", "detection,recognition").split(",")
+    if x.strip()
+]
 
-# Historical Qwen vars kept only so old env/templates do not crash if they still exist.
-# They are not used unless you reintroduce Qwen code intentionally later.
+# Qwen endpoint injected by Lambda/RunPod template. QWEN_RUN_URL is preferred;
+# QWEN_ENDPOINT_ID is kept as a fallback.
+QWEN_ENDPOINT_ID = os.environ.get("QWEN_ENDPOINT_ID")
+QWEN_RUN_URL = os.environ.get("QWEN_RUN_URL")
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
+
+# Qwen settings
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 QWEN_IMAGE_MAX_SIDE = int(os.environ.get("QWEN_IMAGE_MAX_SIDE", "448"))
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "320"))
 QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4"))
-
-# Gemma settings.
-# For A5000 24GB, start with GEMMA_INFERENCE_BATCH_SIZE=2 or 4.
-# The code can split batches on CUDA OOM, so you can push this upward safely.
-GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
-GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", "448"))
-GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", "320"))
-GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "4"))
-GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
-GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
-GEMMA_ATTN_IMPLEMENTATION = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
-
-# Keep false for speed. When true, prints tensor dtypes once per batch.
-GEMMA_DEBUG_INPUT_DTYPES = os.environ.get("GEMMA_DEBUG_INPUT_DTYPES", "false").lower() == "true"
-
-# If a large Gemma batch OOMs, split it into smaller batches automatically.
-GEMMA_SPLIT_BATCH_ON_OOM = os.environ.get("GEMMA_SPLIT_BATCH_ON_OOM", "true").lower() == "true"
-
-# For speed, do not retry a failed batch one image at a time unless explicitly enabled.
-# This prevents the repeated failure loop you saw in logs.
-IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE = os.environ.get(
-    "IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE",
-    "false",
-).lower() == "true"
-
-if GEMMA_QUANTIZATION not in {"none", "4bit", "8bit"}:
-    raise RuntimeError("GEMMA_QUANTIZATION must be one of: none, 4bit, 8bit")
 
 # Text embedding settings
 TEXT_EMBED_MODEL_ID = os.environ.get("TEXT_EMBED_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
@@ -117,9 +103,6 @@ IMAGE_EMBED_MODEL_ID = os.environ.get("IMAGE_EMBED_MODEL_ID", "openai/clip-vit-b
 IMAGE_EMBED_BATCH_SIZE = int(os.environ.get("IMAGE_EMBED_BATCH_SIZE", "16"))
 CULLING_VERSION = os.environ.get("CULLING_VERSION", "v1")
 CLUSTER_VERSION = os.environ.get("CLUSTER_VERSION", "v1")
-
-# Split-worker strict GPU setting. Keep true so Qwen/CLIP/text embedding do not silently run on CPU.
-STRICT_QWEN_GPU = os.environ.get("STRICT_QWEN_GPU", "true").lower() == "true"
 
 os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/runpod-volume/huggingface")
@@ -132,27 +115,35 @@ Path(os.environ["SENTENCE_TRANSFORMERS_HOME"]).mkdir(parents=True, exist_ok=True
 Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
 IMAGE_EXTS = {
-    ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif",
-    ".nef", ".cr2", ".arw", ".dng", ".tif", ".tiff"
+    ".jpg", ".jpeg", ".jpe", ".png", ".webp", ".heic", ".heif",
+    ".nef", ".cr2", ".arw", ".dng", ".tif", ".tiff",
+    ".bmp", ".gif", ".avif", ".jfif"
 }
+
+RAW_IMAGE_EXTS = {".nef", ".cr2", ".arw", ".dng"}
+HEIF_IMAGE_EXTS = {".heic", ".heif"}
 
 UUID_PREFIX_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_.+",
     re.IGNORECASE,
 )
 
-s3 = boto3.client("s3", region_name=AWS_DEFAULT_REGION)
+s3 = boto3.client(
+    "s3",
+    region_name=AWS_DEFAULT_REGION,
+    config=Config(
+        max_pool_connections=max(32, COMPRESS_MAX_WORKERS * 4),
+        retries={"max_attempts": 8, "mode": "standard"},
+    ),
+)
 
 _FACE_APP = None
 _QWEN_MODEL = None
 _QWEN_PROCESSOR = None
 _PROCESS_VISION_INFO = None
-_GEMMA_MODEL = None
-_GEMMA_PROCESSOR = None
 _TEXT_EMBED_MODEL = None
 _IMAGE_EMBED_MODEL = None
 _IMAGE_EMBED_PROCESSOR = None
-_GEMMA_DTYPE_DEBUG_PRINTED = False
 
 
 # DB connection pooling/retry settings.
@@ -163,7 +154,7 @@ _TABLE_COLUMNS_CACHE: Dict[str, set[str]] = {}
 _HAS_TABLE_CACHE: Dict[str, bool] = {}
 
 DB_POOL_MIN_CONN = int(os.environ.get("DB_POOL_MIN_CONN", "1"))
-DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "3"))
+DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "8"))
 DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "8"))
 DB_CONNECT_BASE_SLEEP = float(os.environ.get("DB_CONNECT_BASE_SLEEP", "0.75"))
 DB_APPLICATION_NAME = os.environ.get("DB_APPLICATION_NAME", "photo_ai_worker")
@@ -257,12 +248,12 @@ def _init_db_pool():
 
     assert_env_ready()
 
-    from psycopg2.pool import SimpleConnectionPool
+    from psycopg2.pool import ThreadedConnectionPool
 
     last_err = None
     for attempt in range(DB_CONNECT_RETRIES):
         try:
-            _DB_POOL = SimpleConnectionPool(
+            _DB_POOL = ThreadedConnectionPool(
                 minconn=DB_POOL_MIN_CONN,
                 maxconn=DB_POOL_MAX_CONN,
                 **_connect_kwargs(),
@@ -299,7 +290,9 @@ def get_conn():
 
             return PooledDbConnection(pool_obj, conn)
 
-        except psycopg2.OperationalError as e:
+        except Exception as e:
+            # Threaded compression can temporarily exhaust the tiny DB pool.
+            # Retry instead of failing the photo immediately.
             last_err = e
             sleep_for = min(20.0, DB_CONNECT_BASE_SLEEP * (2 ** attempt))
             print(
@@ -457,23 +450,106 @@ def mean_normalized(vectors: List[np.ndarray]) -> np.ndarray:
 # S3 HELPERS
 # ============================================================
 
-def is_image_key(key: str) -> bool:
-    return Path(key).suffix.lower() in IMAGE_EXTS
+GENERATED_S3_PATH_PARTS = (
+    "/ai-input/",
+    "/annotated/",
+    "/thumbnail/",
+    "/thumbnails/",
+    "/preview/",
+    "/previews/",
+    "/watermarked/",
+    "/faces/",
+    "/covers/",
+    "/edited/",
+    "/exports/",
+    "/collage/",
+    "/collages/",
+)
 
+
+def normalize_s3_prefix(prefix: str) -> str:
+    prefix = str(prefix or "").strip().lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return prefix
+
+
+def force_originals_prefix(album_slug: str, event_slug: str, source_prefix: Optional[str] = None) -> str:
+    """
+    Always scan originals only.
+
+    Protects us when caller accidentally sends:
+      albums/<album>/events/<event>
+    instead of:
+      albums/<album>/events/<event>/originals/
+    """
+    raw = normalize_s3_prefix(source_prefix or "")
+    if "/originals/" in raw:
+        return raw
+    return f"albums/{album_slug}/events/{event_slug}/originals/"
+
+
+def normalize_event_source_prefixes(album_slug: str, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for event in events:
+        item = dict(event)
+        slug = item.get("slug")
+        if not slug:
+            raise ValueError(f"Event is missing slug: {event}")
+        item["source_prefix"] = force_originals_prefix(album_slug, slug, item.get("source_prefix"))
+        normalized.append(item)
+    return normalized
+
+
+def originals_prefix_for_event(album_ctx: Dict[str, Any], event: Dict[str, Any]) -> str:
+    return force_originals_prefix(
+        album_ctx["album_slug"],
+        event["slug"],
+        event.get("source_prefix"),
+    )
+
+
+def is_generated_pipeline_key(key: str) -> bool:
+    if not key:
+        return True
+    normalized = "/" + str(key).strip().lstrip("/")
+    return any(part in normalized for part in GENERATED_S3_PATH_PARTS)
+
+
+def is_image_key(key: str) -> bool:
+    # S3 keys under source_prefix/originals are supposed to be photos.
+    # Never ingest generated pipeline images as new originals.
+    if not key or key.endswith("/"):
+        return False
+
+    if is_generated_pipeline_key(key):
+        return False
+
+    name = Path(key).name
+    if name.startswith(".") or name.lower() in {"thumbs.db", ".ds_store"}:
+        return False
+
+    ext = Path(key).suffix.lower()
+    if ext in IMAGE_EXTS:
+        return True
+
+    # Be liberal only inside originals for odd photographer extensions.
+    return "/originals/" in ("/" + str(key).strip().lstrip("/"))
 
 def is_generated_original_key(key: str) -> bool:
     return bool(UUID_PREFIX_RE.match(Path(key).name))
 
 
+
 def list_s3_objects(prefix: str) -> List[Dict[str, Any]]:
     objects: List[Dict[str, Any]] = []
     paginator = s3.get_paginator("list_objects_v2")
+    prefix = normalize_s3_prefix(prefix)
 
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         objects.extend(page.get("Contents", []))
 
     return objects
-
 
 def s3_key_exists(key: str) -> bool:
     try:
@@ -519,9 +595,18 @@ def delete_s3_prefix(prefix: str) -> int:
 # ============================================================
 
 def read_image_any(local_path: Path) -> Image.Image:
+    """
+    Read common photographer image formats by content, not only by extension.
+
+    Supported:
+    - JPEG/PNG/WebP/TIFF/BMP/GIF/AVIF if Pillow supports it in the image
+    - HEIC/HEIF if pillow-heif is installed
+    - RAW files NEF/CR2/ARW/DNG via rawpy
+    - Unknown extensions are still attempted with PIL and then OpenCV
+    """
     ext = local_path.suffix.lower()
 
-    if ext in {".nef", ".cr2", ".arw", ".dng"}:
+    if ext in RAW_IMAGE_EXTS:
         try:
             import rawpy
             with rawpy.imread(str(local_path)) as raw:
@@ -534,11 +619,34 @@ def read_image_any(local_path: Path) -> Image.Image:
         except Exception as e:
             raise RuntimeError(
                 f"RAW image read failed for {local_path}. "
-                "Install rawpy/imageio or convert RAW before upload."
+                "Install rawpy or convert RAW before upload."
             ) from e
 
-    img = Image.open(local_path)
-    return ImageOps.exif_transpose(img).convert("RGB")
+    if ext in HEIF_IMAGE_EXTS:
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except Exception as e:
+            print(f"HEIF opener not available for {local_path}: {repr(e)}", flush=True)
+
+    try:
+        img = Image.open(local_path)
+        img.load()
+        return ImageOps.exif_transpose(img).convert("RGB")
+    except Exception as pil_err:
+        # Last fallback: OpenCV can decode some images by content even when the suffix is odd.
+        try:
+            data = np.fromfile(str(local_path), dtype=np.uint8)
+            bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise RuntimeError("cv2.imdecode returned None")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb).convert("RGB")
+        except Exception as cv_err:
+            raise RuntimeError(
+                f"Image read failed for {local_path}. "
+                f"PIL error={repr(pil_err)}; OpenCV error={repr(cv_err)}"
+            ) from cv_err
 
 
 def save_ai_input_webp(source_local: Path, output_local: Path) -> Tuple[int, int]:
@@ -549,25 +657,12 @@ def save_ai_input_webp(source_local: Path, output_local: Path) -> Tuple[int, int
     return img.size
 
 
-def image_text_max_side() -> int:
-    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
-        return GEMMA_IMAGE_MAX_SIDE
-    return QWEN_IMAGE_MAX_SIDE
-
-
-def make_qwen_image(input_path: Path, max_side: Optional[int] = None) -> Path:
-    """
-    Historical name kept so the rest of the worker does not need a DB/status rename.
-    It prepares the smaller annotated image for either Qwen or Gemma.
-    """
-    max_side = int(max_side or image_text_max_side())
-
+def make_qwen_image(input_path: Path, max_side: int = QWEN_IMAGE_MAX_SIDE) -> Path:
     img = Image.open(input_path).convert("RGB")
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-    out = input_path.parent / (f"{IMAGE_TEXT_MODEL_PROVIDER}_" + input_path.stem + ".jpg")
+    out = input_path.parent / ("qwen_" + input_path.stem + ".jpg")
     img.save(out, "JPEG", quality=82)
     return out
-
 
 
 # ============================================================
@@ -804,6 +899,7 @@ def create_photo_row(album_ctx: Dict[str, Any], event: Dict[str, Any], source_ke
         conn.close()
 
 
+
 def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
     album_id = album_ctx["album_id"]
 
@@ -811,38 +907,34 @@ def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, 
     total_images = 0
     total_usable = 0
     total_generated_skipped = 0
+    total_non_image_skipped = 0
     created_rows = 0
     skipped_existing = 0
     failed = 0
     per_event = []
 
     for event in events:
-        prefix = event["source_prefix"]
+        requested_prefix = normalize_s3_prefix(event.get("source_prefix") or "")
+        prefix = originals_prefix_for_event(album_ctx, event)
         event_id = event["event_id"]
 
         objects = list_s3_objects(prefix)
-        image_objects = [o for o in objects if is_image_key(o["Key"])]
-
-        # Skip UUID-prefixed generated originals only when there are non-generated originals.
-        # If a folder only contains UUID-prefixed keys, we treat them as usable because some existing folders are structured that way.
-        generated_objects = [o for o in image_objects if is_generated_original_key(o["Key"])]
-        normal_objects = [o for o in image_objects if not is_generated_original_key(o["Key"])]
-
-        if normal_objects:
-            usable_objects = normal_objects
-        else:
-            usable_objects = image_objects
-            generated_objects = []
+        generated_objects = [o for o in objects if is_generated_pipeline_key(o.get("Key", ""))]
+        image_objects = [o for o in objects if is_image_key(o.get("Key", ""))]
+        usable_objects = image_objects
+        non_image_skipped = max(0, len(objects) - len(generated_objects) - len(image_objects))
 
         total_scanned += len(objects)
         total_images += len(image_objects)
         total_usable += len(usable_objects)
         total_generated_skipped += len(generated_objects)
+        total_non_image_skipped += non_image_skipped
 
         print(
-            f"Scanning {event['name']}: raw={len(objects)}, "
-            f"images={len(image_objects)}, usable={len(usable_objects)}, "
-            f"generated_to_skip={len(generated_objects)}, prefix={prefix}",
+            f"Scanning {event['name']}: "
+            f"requested_prefix={requested_prefix}, actual_prefix={prefix}, "
+            f"raw={len(objects)}, images={len(image_objects)}, usable={len(usable_objects)}, "
+            f"generated_skipped={len(generated_objects)}, non_image_skipped={non_image_skipped}",
             flush=True,
         )
 
@@ -855,6 +947,9 @@ def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, 
             size = int(obj.get("Size") or 0)
 
             try:
+                if is_generated_pipeline_key(key):
+                    continue
+
                 existing = get_existing_photo_by_source(album_id, event_id, key)
                 if existing:
                     skipped_existing += 1
@@ -872,11 +967,13 @@ def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, 
 
         per_event.append({
             "event": event["slug"],
-            "source_prefix": prefix,
+            "requested_prefix": requested_prefix,
+            "actual_prefix": prefix,
             "objects": len(objects),
             "image_objects": len(image_objects),
             "usable_images": len(usable_objects),
             "generated_skipped": len(generated_objects),
+            "non_image_skipped": non_image_skipped,
             "created_rows": event_created,
             "skipped_existing": event_existing,
             "failed": event_failed,
@@ -887,6 +984,7 @@ def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, 
         "total_image_objects": total_images,
         "total_usable_images": total_usable,
         "total_generated_skipped": total_generated_skipped,
+        "total_non_image_skipped": total_non_image_skipped,
         "created_rows": created_rows,
         "skipped_existing": skipped_existing,
         "failed": failed,
@@ -895,7 +993,6 @@ def scan_and_ingest_originals(album_ctx: Dict[str, Any], events: List[Dict[str, 
 
     print("Ingest result:", result, flush=True)
     return result
-
 
 def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
     album_id = album_ctx["album_id"]
@@ -968,8 +1065,12 @@ def validate_s3_sources(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
 # COMPRESSION / AI INPUT
 # ============================================================
 
-def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
+def compress_one_photo(
+    row: Dict[str, Any],
+    photo_cols: Optional[set[str]] = None,
+) -> Tuple[str, str, Optional[str]]:
     photo_id = str(row["id"])
+
     try:
         tmpdir = LOCAL_WORK / "compress" / photo_id
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -978,12 +1079,6 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
         if not source_key:
             raise RuntimeError("missing original/source S3 key")
 
-        original_local = tmpdir / Path(source_key).name
-        ai_local = tmpdir / "ai.webp"
-
-        download_file(source_key, original_local)
-        width, height = save_ai_input_webp(original_local, ai_local)
-
         ai_key = row.get("ai_input_s3_key")
         if not ai_key:
             album_slug = row["storage_album_slug"]
@@ -991,16 +1086,43 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
             photo_uuid = row.get("photo_uuid") or photo_id
             ai_key = f"albums/{album_slug}/events/{event_slug}/ai-input/{photo_uuid}.webp"
 
+        # Optional fast path for retries: do not regenerate if the AI input object already exists.
+        if COMPRESS_REUSE_EXISTING_AI_INPUT and ai_key and s3_key_exists(ai_key):
+            cols = photo_cols or table_columns("photos")
+            set_parts = [
+                "compression_status='completed'",
+                "compression_error=NULL",
+                "ai_input_s3_key=%s",
+                "updated_at=now()",
+            ]
+            values: List[Any] = [ai_key]
+            values.append(photo_id)
+            execute_sql(
+                f"""
+                UPDATE photos
+                SET {", ".join(set_parts)}
+                WHERE id=%s::uuid;
+                """,
+                tuple(values),
+            )
+            return "ok", photo_id, None
+
+        suffix = Path(source_key).suffix or ".img"
+        original_local = tmpdir / f"original{suffix}"
+        ai_local = tmpdir / "ai.webp"
+
+        download_file(source_key, original_local)
+        width, height = save_ai_input_webp(original_local, ai_local)
         upload_file(ai_local, ai_key, "image/webp")
 
-        cols = table_columns("photos")
+        cols = photo_cols or table_columns("photos")
         set_parts = [
             "compression_status='completed'",
             "compression_error=NULL",
             "ai_input_s3_key=%s",
-            "updated_at=now()"
+            "updated_at=now()",
         ]
-        values = [ai_key]
+        values: List[Any] = [ai_key]
 
         if "width" in cols:
             set_parts.append("width=%s")
@@ -1024,7 +1146,7 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
 
     except Exception as e:
         err = repr(e)
-        execute_sql("""
+        execute_sql_best_effort("""
             UPDATE photos
             SET compression_status='failed',
                 compression_error=%s,
@@ -1032,6 +1154,13 @@ def compress_one_photo(row: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
             WHERE id=%s::uuid;
         """, (err, photo_id))
         return "failed", photo_id, err
+
+    finally:
+        # Keep /tmp from growing during big albums.
+        try:
+            shutil.rmtree(LOCAL_WORK / "compress" / photo_id, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1048,19 +1177,66 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
         ORDER BY created_at;
     """, (album_id, event_ids))
 
+    if not rows:
+        result = {
+            "rows": 0,
+            "ok": 0,
+            "failed": 0,
+            "errors": [],
+            "parallel": True,
+            "workers": 0,
+        }
+        print("Compression result:", result, flush=True)
+        return result
+
+    worker_count = max(1, min(COMPRESS_MAX_WORKERS, len(rows)))
+    photo_cols = table_columns("photos")
+
     ok = 0
     failed = 0
     errors = []
+    started = time.time()
 
-    for row in rows:
-        status, photo_id, err = compress_one_photo(row)
-        if status == "ok":
-            ok += 1
-        else:
-            failed += 1
-            errors.append({"photo_id": photo_id, "error": err})
+    print(
+        f"Compression parallel start: rows={len(rows)}, workers={worker_count}, "
+        f"reuse_existing_ai_input={COMPRESS_REUSE_EXISTING_AI_INPUT}",
+        flush=True,
+    )
 
-    result = {"rows": len(rows), "ok": ok, "failed": failed, "errors": errors[:25]}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(compress_one_photo, row, photo_cols) for row in rows]
+
+        for i, future in enumerate(as_completed(futures), start=1):
+            try:
+                status, photo_id, err = future.result()
+            except Exception as e:
+                status, photo_id, err = "failed", "unknown", repr(e)
+
+            if status == "ok":
+                ok += 1
+            else:
+                failed += 1
+                if len(errors) < 25:
+                    errors.append({"photo_id": photo_id, "error": err})
+
+            if COMPRESS_LOG_EVERY > 0 and (i % COMPRESS_LOG_EVERY == 0 or i == len(rows)):
+                elapsed = max(0.001, time.time() - started)
+                print(
+                    f"Compression progress: {i}/{len(rows)} done, ok={ok}, failed={failed}, "
+                    f"rate={i / elapsed:.2f} photos/sec",
+                    flush=True,
+                )
+
+    result = {
+        "rows": len(rows),
+        "ok": ok,
+        "failed": failed,
+        "errors": errors[:25],
+        "parallel": True,
+        "workers": worker_count,
+        "seconds": round(time.time() - started, 2),
+        "photos_per_second": round(len(rows) / max(0.001, time.time() - started), 3),
+    }
     print("Compression result:", result, flush=True)
     return result
 
@@ -1069,87 +1245,390 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
 # INSIGHTFACE
 # ============================================================
 
-def preload_cuda_libs_for_onnxruntime():
+class InsightFaceCudaLoader:
     """
-    Helps ONNXRuntime load CUDA/cuDNN libraries from pip packages and CUDA image
-    before it falls back to incompatible system libraries.
+    Strict CUDA loader for InsightFace + ONNXRuntime.
+
+    Why this exists:
+    - ort.get_available_providers() can show CUDAExecutionProvider even when CUDA cannot actually load.
+    - InsightFace may silently fall back to CPUExecutionProvider.
+    - We want to fail early if required CUDA/cuDNN libs are missing.
     """
-    import os
-    import site
-    import glob
-    import ctypes
 
-    candidate_dirs = []
-
-    for base in site.getsitepackages():
-        candidate_dirs.extend(glob.glob(os.path.join(base, "nvidia", "*", "lib")))
-
-    existing = os.environ.get("LD_LIBRARY_PATH", "")
-    os.environ["LD_LIBRARY_PATH"] = ":".join(candidate_dirs + ([existing] if existing else []))
-
-    preload_names = [
-        "libcublas.so.12",
-        "libcublasLt.so.12",
-        "libcudart.so.12",
+    REQUIRED_CUDNN_LIBS = [
         "libcudnn.so.9",
+        "libcudnn_adv.so.9",
+        "libcudnn_cnn.so.9",
         "libcudnn_graph.so.9",
         "libcudnn_ops.so.9",
-        "libcudnn_cnn.so.9",
-        "libnvrtc.so.12",
     ]
 
-    loaded = []
-    for d in candidate_dirs:
-        for name in preload_names:
-            path = os.path.join(d, name)
-            if os.path.exists(path):
-                try:
-                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-                    loaded.append(path)
-                except Exception as e:
-                    print(f"Could not preload {path}: {e}", flush=True)
+    OPTIONAL_CUDNN_LIBS = [
+        "libcudnn_engines_precompiled.so.9",
+        "libcudnn_engines_runtime_compiled.so.9",
+        "libcudnn_heuristic.so.9",
+    ]
 
-    print("CUDA preload dirs:", candidate_dirs, flush=True)
-    print("CUDA preloaded libs:", loaded, flush=True)
+    CUDA_LIBS = [
+        "libcuda.so.1",
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libcufft.so.11",
+        "libcurand.so.10",
+        "libcusolver.so.11",
+        "libcusparse.so.12",
+        "libnvrtc.so.12",
+        "libnvJitLink.so.12",
+        "libnvToolsExt.so.1",
+    ]
+
+    def __init__(
+        self,
+        det_size: Tuple[int, int],
+        allowed_modules: List[str],
+        strict_gpu: bool = True,
+    ):
+        self.det_size = det_size
+        self.allowed_modules = allowed_modules
+        self.strict_gpu = strict_gpu
+
+    def find_candidate_lib_dirs(self) -> List[str]:
+        import site
+        import sysconfig
+        import glob
+
+        dirs: List[str] = []
+
+        for base in site.getsitepackages():
+            dirs.extend(glob.glob(os.path.join(base, "nvidia", "*", "lib")))
+
+        user_site = site.getusersitepackages()
+        if user_site:
+            dirs.extend(glob.glob(os.path.join(user_site, "nvidia", "*", "lib")))
+
+        purelib = sysconfig.get_paths().get("purelib")
+        if purelib:
+            dirs.extend(glob.glob(os.path.join(purelib, "nvidia", "*", "lib")))
+
+        dirs.extend([
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda/compat",
+            "/usr/lib/x86_64-linux-gnu",
+            "/opt/conda/lib",
+        ])
+
+        clean: List[str] = []
+        seen = set()
+
+        for d in dirs:
+            if not d:
+                continue
+            if not os.path.isdir(d):
+                continue
+            if d in seen:
+                continue
+            seen.add(d)
+            clean.append(d)
+
+        return clean
+
+    def update_library_path(self, candidate_dirs: List[str]) -> None:
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        parts = candidate_dirs + ([existing] if existing else [])
+        os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+        # ONNXRuntime also checks this in some CUDA builds.
+        existing_ort = os.environ.get("ORT_CUDA_LIB_PATH", "")
+        if not existing_ort:
+            cuda_dirs = [
+                d for d in candidate_dirs
+                if "/nvidia/" in d or "/cuda" in d or "conda" in d
+            ]
+            if cuda_dirs:
+                os.environ["ORT_CUDA_LIB_PATH"] = ":".join(cuda_dirs)
+
+    def find_lib(self, candidate_dirs: List[str], lib_name: str) -> Optional[str]:
+        for d in candidate_dirs:
+            path = os.path.join(d, lib_name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def preload_one(self, path: str) -> Tuple[bool, Optional[str]]:
+        import ctypes
+
+        try:
+            ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            return True, None
+        except Exception as e:
+            return False, repr(e)
+
+    def preload_cuda_libs_for_onnxruntime(self) -> Dict[str, Any]:
+        """
+        Preload CUDA/cuDNN from pip-installed nvidia packages before InsightFace creates sessions.
+
+        This intentionally fails if required cuDNN 9 split libs are missing.
+        """
+        candidate_dirs = self.find_candidate_lib_dirs()
+        self.update_library_path(candidate_dirs)
+
+        loaded: List[str] = []
+        failed: List[Dict[str, str]] = []
+        found_required: Dict[str, Optional[str]] = {}
+
+        # Load lower-level CUDA libs first.
+        for lib_name in self.CUDA_LIBS:
+            path = self.find_lib(candidate_dirs, lib_name)
+            if not path:
+                continue
+
+            ok, err = self.preload_one(path)
+            if ok:
+                loaded.append(path)
+            else:
+                failed.append({"lib": lib_name, "path": path, "error": err or ""})
+
+        # Required cuDNN libs.
+        for lib_name in self.REQUIRED_CUDNN_LIBS:
+            path = self.find_lib(candidate_dirs, lib_name)
+            found_required[lib_name] = path
+
+            if not path:
+                continue
+
+            ok, err = self.preload_one(path)
+            if ok:
+                loaded.append(path)
+            else:
+                failed.append({"lib": lib_name, "path": path, "error": err or ""})
+
+        # Optional cuDNN libs. Load if present.
+        found_optional: Dict[str, Optional[str]] = {}
+        for lib_name in self.OPTIONAL_CUDNN_LIBS:
+            path = self.find_lib(candidate_dirs, lib_name)
+            found_optional[lib_name] = path
+
+            if not path:
+                continue
+
+            ok, err = self.preload_one(path)
+            if ok:
+                loaded.append(path)
+            else:
+                failed.append({"lib": lib_name, "path": path, "error": err or ""})
+
+        missing_required = [
+            name for name, path in found_required.items()
+            if not path
+        ]
+
+        payload = {
+            "candidate_dirs": candidate_dirs,
+            "loaded": loaded,
+            "failed": failed,
+            "found_required_cudnn": found_required,
+            "found_optional_cudnn": found_optional,
+            "missing_required_cudnn": missing_required,
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+            "ort_cuda_lib_path": os.environ.get("ORT_CUDA_LIB_PATH", ""),
+        }
+
+        print("CUDA preload result:", json.dumps(payload, default=str), flush=True)
+
+        if missing_required:
+            raise RuntimeError(
+                "Missing required cuDNN libraries for ONNXRuntime CUDAExecutionProvider: "
+                f"{missing_required}. "
+                "Fix Docker image requirements. Add nvidia-cudnn-cu12, rebuild without cache, "
+                "and do not allow CPU fallback."
+            )
+
+        hard_failures = [
+            f for f in failed
+            if f["lib"] in self.REQUIRED_CUDNN_LIBS
+        ]
+
+        if hard_failures:
+            raise RuntimeError(
+                "Required cuDNN libraries were found but failed to preload: "
+                f"{hard_failures}"
+            )
+
+        return payload
+
+    def print_torch_status(self) -> None:
+        import torch
+
+        print("torch:", torch.__version__, flush=True)
+        print("torch cuda:", torch.version.cuda, flush=True)
+        print("torch cuda available:", torch.cuda.is_available(), flush=True)
+        print("torch device count:", torch.cuda.device_count(), flush=True)
+
+        if torch.cuda.is_available():
+            print("torch gpu name:", torch.cuda.get_device_name(0), flush=True)
+            print("torch gpu capability:", torch.cuda.get_device_capability(0), flush=True)
+
+    def validate_torch_cuda(self) -> None:
+        import torch
+
+        if not self.strict_gpu:
+            return
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "STRICT_FACE_GPU=true but torch.cuda.is_available() is false. "
+                "Refusing to run face indexing on CPU."
+            )
+
+        try:
+            # Real CUDA execution check, not just availability.
+            x = torch.randn((256, 256), device="cuda")
+            y = x @ x
+            torch.cuda.synchronize()
+            del x, y
+        except Exception as e:
+            raise RuntimeError(
+                "Torch CUDA test failed. Refusing to run face indexing."
+            ) from e
+
+    def get_onnxruntime_providers(self) -> List[str]:
+        import onnxruntime as ort
+
+        try:
+            ort.set_default_logger_severity(2)
+        except Exception:
+            pass
+
+        available = ort.get_available_providers()
+        print("onnxruntime:", ort.__version__, flush=True)
+        print("ONNXRuntime device:", ort.get_device(), flush=True)
+        print("ONNXRuntime providers:", available, flush=True)
+        return available
+
+    def build_provider_list(self) -> List[Any]:
+        return [
+            (
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0,
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "0",
+                    "do_copy_in_default_stream": "1",
+                },
+            ),
+
+            # CPU is listed second only as fallback for unsupported ops.
+            # We still validate detection/recognition sessions start with CUDA.
+            "CPUExecutionProvider",
+        ]
+
+    def load(self):
+        self.preload_cuda_libs_for_onnxruntime()
+
+        self.print_torch_status()
+        self.validate_torch_cuda()
+
+        available = self.get_onnxruntime_providers()
+
+        if "CUDAExecutionProvider" not in available:
+            raise RuntimeError(
+                f"CUDAExecutionProvider missing. Available providers={available}. "
+                "Refusing to run InsightFace on CPU because GPU is required."
+            )
+
+        from insightface.app import FaceAnalysis
+
+        providers = self.build_provider_list()
+
+        print("InsightFace allowed modules:", self.allowed_modules, flush=True)
+        print("InsightFace provider request:", providers, flush=True)
+
+        app = FaceAnalysis(
+            name="buffalo_l",
+            providers=providers,
+            allowed_modules=self.allowed_modules,
+        )
+
+        app.prepare(ctx_id=0, det_size=self.det_size)
+
+        required_models = set(self.allowed_modules)
+        loaded_models = set(app.models.keys())
+
+        print("InsightFace loaded models:", sorted(loaded_models), flush=True)
+
+        missing = required_models - loaded_models
+        if missing:
+            raise RuntimeError(
+                f"InsightFace did not load required modules: {sorted(missing)}"
+            )
+
+        provider_report: Dict[str, List[str]] = {}
+
+        for name, model in app.models.items():
+            sess = getattr(model, "session", None)
+            if not sess:
+                print(
+                    f"InsightFace model {name} has no ONNX session; skipping provider validation",
+                    flush=True,
+                )
+                continue
+
+            session_providers = sess.get_providers()
+            provider_report[name] = session_providers
+
+            print(
+                f"InsightFace model {name} providers: {session_providers}",
+                flush=True,
+            )
+
+            if self.strict_gpu and name in required_models:
+                if not session_providers:
+                    raise RuntimeError(
+                        f"InsightFace required model {name} has no providers."
+                    )
+
+                if session_providers[0] != "CUDAExecutionProvider":
+                    raise RuntimeError(
+                        f"InsightFace required model {name} did not start with CUDA first. "
+                        f"Providers={session_providers}. "
+                        "This usually means ONNXRuntime CUDA provider could not load cuDNN/CUDA libs."
+                    )
+
+        print(
+            "InsightFace required models loaded with CUDAExecutionProvider:",
+            provider_report,
+            flush=True,
+        )
+
+        return app
+
+
+def preload_cuda_libs_for_onnxruntime():
+    """
+    Backward-compatible wrapper for existing code.
+    """
+    loader = InsightFaceCudaLoader(
+        det_size=FACE_DET_SIZE,
+        allowed_modules=INSIGHTFACE_ALLOWED_MODULES,
+        strict_gpu=STRICT_FACE_GPU,
+    )
+    return loader.preload_cuda_libs_for_onnxruntime()
 
 
 def load_face_app():
     global _FACE_APP
+
     if _FACE_APP is not None:
         return _FACE_APP
 
-    preload_cuda_libs_for_onnxruntime()
+    loader = InsightFaceCudaLoader(
+        det_size=FACE_DET_SIZE,
+        allowed_modules=INSIGHTFACE_ALLOWED_MODULES,
+        strict_gpu=STRICT_FACE_GPU,
+    )
 
-    import onnxruntime as ort
-    from insightface.app import FaceAnalysis
-
-    available = ort.get_available_providers()
-    print("ONNXRuntime providers:", available, flush=True)
-
-    if "CUDAExecutionProvider" not in available:
-        raise RuntimeError(
-            f"CUDAExecutionProvider missing. Available providers={available}. "
-            "Refusing to run InsightFace on CPU because GPU is expected."
-        )
-
-    providers = [
-        (
-            "CUDAExecutionProvider",
-            {
-                "device_id": 0,
-                "cudnn_conv_algo_search": "HEURISTIC",
-                "do_copy_in_default_stream": "1",
-                "cudnn_conv_use_max_workspace": "0"
-            }
-        ),
-        "CPUExecutionProvider"
-    ]
-
-    app = FaceAnalysis(name="buffalo_l", providers=providers)
-    app.prepare(ctx_id=0, det_size=FACE_DET_SIZE)
-
-    _FACE_APP = app
-    print("InsightFace loaded on GPU", flush=True)
+    _FACE_APP = loader.load()
     return _FACE_APP
 
 
@@ -1326,10 +1805,55 @@ class DSU:
             self.r[ra] += 1
 
 
-def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
-    album_id = album_ctx["album_id"]
 
-    face_rows = db_all("""
+def _event_ids(events: Optional[List[Dict[str, Any]]]) -> List[str]:
+    return [str(e["event_id"]) for e in (events or []) if e.get("event_id")]
+
+
+def _event_filter_sql(alias: str, event_ids: List[str]) -> str:
+    if not event_ids:
+        return ""
+    return f"AND {alias}.album_event_id = ANY(%s::uuid[])"
+
+
+def safe_add_new_people_without_touching_existing_names(
+    album_ctx: Dict[str, Any],
+    events: Optional[List[Dict[str, Any]]] = None,
+    build_candidates: bool = False,
+    crop_covers: bool = False,
+) -> Dict[str, Any]:
+    """
+    Safe reconciliation.
+
+    - Labels only unlabeled faces.
+    - Preserves existing people and display names.
+    - For event runs, processes only those event faces.
+    - Still matches event faces against existing album-level people.
+    - Does not auto-merge duplicates.
+    - Expensive cover-crop/duplicate-candidate steps are opt-in.
+    """
+    started = time.time()
+    album_id = album_ctx["album_id"]
+    event_ids = _event_ids(events)
+    face_event_filter = _event_filter_sql("f", event_ids)
+
+    face_params: List[Any] = [album_id]
+    if event_ids:
+        face_params.append(event_ids)
+
+    print(
+        "safe_people_reconcile start:",
+        {
+            "album_id": album_id,
+            "event_scoped": bool(event_ids),
+            "event_ids": event_ids,
+            "build_candidates": build_candidates,
+            "crop_covers": crop_covers,
+        },
+        flush=True,
+    )
+
+    face_rows = db_all(f"""
         SELECT
             f.id,
             f.album_id,
@@ -1339,18 +1863,32 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
             f.face_quality_score,
             f.detection_confidence
         FROM faces f
+        JOIN photos p ON p.id = f.photo_id
         WHERE f.album_id = %s::uuid
+          {face_event_filter}
           AND f.person_id IS NULL
+          AND f.embedding IS NOT NULL
+          AND COALESCE(p.is_deleted, false) = false
         ORDER BY f.face_quality_score DESC NULLS LAST, f.created_at;
-    """, (album_id,))
+    """, tuple(face_params))
+
+    print(
+        "safe_people_reconcile loaded unlabeled faces:",
+        {"count": len(face_rows), "seconds": round(time.time() - started, 2)},
+        flush=True,
+    )
 
     if not face_rows:
-        rebuild_photo_people_base_safe(album_ctx)
+        rebuild_result = rebuild_photo_people_base_safe(album_ctx, events)
         return {
+            "event_scoped": bool(event_ids),
+            "event_ids": event_ids,
             "unlabeled_faces": 0,
             "assigned_to_existing_people": 0,
             "new_people_created": 0,
+            "rebuild_photo_people": rebuild_result,
             "message": "No unlabeled faces found. Existing people untouched.",
+            "seconds": round(time.time() - started, 2),
         }
 
     existing_people = db_all("""
@@ -1367,30 +1905,61 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
         ORDER BY person_number;
     """, (album_id,))
 
+    print(
+        "safe_people_reconcile loaded existing people:",
+        {"count": len(existing_people), "seconds": round(time.time() - started, 2)},
+        flush=True,
+    )
+
     face_vecs = [parse_pg_vector(r["embedding"]) for r in face_rows]
 
-    assigned_to_existing = []
+    assigned_to_existing: List[Tuple[str, str]] = []
     remaining_indices = list(range(len(face_rows)))
 
     if existing_people:
         people_vecs = [parse_pg_vector(p["centroid_embedding"]) for p in existing_people]
         P = np.stack(people_vecs).astype(np.float32)
-        F = np.stack(face_vecs).astype(np.float32)
+        still_remaining: List[int] = []
+        batch_size = 2048
 
-        sims = F @ P.T
-        best_people_idx = sims.argmax(axis=1)
-        best_scores = sims.max(axis=1)
+        for start_i in range(0, len(face_vecs), batch_size):
+            end_i = min(len(face_vecs), start_i + batch_size)
+            F = np.stack(face_vecs[start_i:end_i]).astype(np.float32)
+            sims = F @ P.T
+            best_people_idx = sims.argmax(axis=1)
+            best_scores = sims.max(axis=1)
 
-        still_remaining = []
+            for local_i, score in enumerate(best_scores):
+                global_i = start_i + local_i
+                if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
+                    person = existing_people[int(best_people_idx[local_i])]
+                    assigned_to_existing.append((str(person["id"]), str(face_rows[global_i]["id"])))
+                else:
+                    still_remaining.append(global_i)
 
-        for i, score in enumerate(best_scores):
-            if float(score) >= PEOPLE_MATCH_EXISTING_SIM_THRESHOLD:
-                person = existing_people[int(best_people_idx[i])]
-                assigned_to_existing.append((str(person["id"]), str(face_rows[i]["id"])))
-            else:
-                still_remaining.append(i)
+            print(
+                "safe_people_reconcile match progress:",
+                {
+                    "processed_faces": end_i,
+                    "total_faces": len(face_vecs),
+                    "assigned_so_far": len(assigned_to_existing),
+                    "remaining_so_far": len(still_remaining),
+                    "seconds": round(time.time() - started, 2),
+                },
+                flush=True,
+            )
 
         remaining_indices = still_remaining
+
+    print(
+        "safe_people_reconcile matching complete:",
+        {
+            "assigned_to_existing": len(assigned_to_existing),
+            "remaining_for_new_clusters": len(remaining_indices),
+            "seconds": round(time.time() - started, 2),
+        },
+        flush=True,
+    )
 
     new_clusters: Dict[int, List[int]] = {}
 
@@ -1399,13 +1968,28 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
             new_clusters[0] = remaining_indices
         else:
             X = np.stack([face_vecs[i] for i in remaining_indices]).astype(np.float32)
-            sims = X @ X.T
             dsu = DSU(len(remaining_indices))
+            block = 512
 
-            for i in range(len(remaining_indices)):
-                for j in range(i + 1, len(remaining_indices)):
-                    if float(sims[i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
-                        dsu.union(i, j)
+            for start_i in range(0, len(remaining_indices), block):
+                end_i = min(len(remaining_indices), start_i + block)
+                sims_block = X[start_i:end_i] @ X.T
+
+                for local_i in range(end_i - start_i):
+                    i = start_i + local_i
+                    for j in range(i + 1, len(remaining_indices)):
+                        if float(sims_block[local_i, j]) >= NEW_FACE_CLUSTER_SIM_THRESHOLD:
+                            dsu.union(i, j)
+
+                print(
+                    "safe_people_reconcile cluster progress:",
+                    {
+                        "processed_remaining": end_i,
+                        "total_remaining": len(remaining_indices),
+                        "seconds": round(time.time() - started, 2),
+                    },
+                    flush=True,
+                )
 
             temp: Dict[int, List[int]] = {}
             for local_i, original_i in enumerate(remaining_indices):
@@ -1413,6 +1997,12 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
                 temp.setdefault(root, []).append(original_i)
 
             new_clusters = {idx: vals for idx, vals in enumerate(temp.values())}
+
+    print(
+        "safe_people_reconcile clusters prepared:",
+        {"new_clusters": len(new_clusters), "seconds": round(time.time() - started, 2)},
+        flush=True,
+    )
 
     conn = get_conn()
     new_people_created = 0
@@ -1430,7 +2020,7 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
                         WHERE f.id = v.face_id::uuid;
                         """,
                         assigned_to_existing,
-                        template="(%s, %s)"
+                        template="(%s, %s)",
                     )
 
                 cur.execute("""
@@ -1440,7 +2030,7 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
                 """, (album_id,))
                 next_num = int(cur.fetchone()["max_num"] or 0) + 1
 
-                for _, face_indices in new_clusters.items():
+                for cluster_i, face_indices in new_clusters.items():
                     group_faces = [face_rows[i] for i in face_indices]
                     group_vecs = [face_vecs[i] for i in face_indices]
 
@@ -1494,7 +2084,6 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
                     ))
 
                     person_id = str(cur.fetchone()["id"])
-
                     face_update_rows = [(person_id, str(f["id"])) for f in group_faces]
 
                     execute_values(
@@ -1506,7 +2095,18 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
                         WHERE f.id = v.face_id::uuid;
                         """,
                         face_update_rows,
-                        template="(%s, %s)"
+                        template="(%s, %s)",
+                    )
+
+                    print(
+                        "safe_people_reconcile created person:",
+                        {
+                            "person_number": next_num,
+                            "person_id": person_id,
+                            "cluster_index": cluster_i,
+                            "faces": len(group_faces),
+                        },
+                        flush=True,
                     )
 
                     next_num += 1
@@ -1537,30 +2137,81 @@ def safe_add_new_people_without_touching_existing_names(album_ctx: Dict[str, Any
     finally:
         conn.close()
 
-    rebuild_photo_people_base_safe(album_ctx)
-    crop_and_upload_missing_person_covers(album_ctx)
-    build_duplicate_candidates(album_ctx)
+    print(
+        "safe_people_reconcile DB updates complete:",
+        {
+            "assigned_to_existing": len(assigned_to_existing),
+            "new_people_created": new_people_created,
+            "seconds": round(time.time() - started, 2),
+        },
+        flush=True,
+    )
 
-    return {
+    rebuild_result = rebuild_photo_people_base_safe(album_ctx, events)
+
+    cover_result = None
+    if crop_covers:
+        cover_result = crop_and_upload_missing_person_covers(album_ctx)
+
+    duplicate_result = None
+    if build_candidates:
+        duplicate_result = build_duplicate_candidates(album_ctx)
+
+    result = {
+        "event_scoped": bool(event_ids),
+        "event_ids": event_ids,
         "unlabeled_faces": len(face_rows),
         "assigned_to_existing_people": len(assigned_to_existing),
+        "remaining_faces_clustered": len(remaining_indices),
+        "new_clusters": len(new_clusters),
         "new_people_created": new_people_created,
         "existing_people_untouched": True,
         "names_preserved": True,
+        "rebuild_photo_people": rebuild_result,
+        "cover_crop": cover_result,
+        "duplicate_candidates": duplicate_result,
+        "seconds": round(time.time() - started, 2),
     }
 
+    print("safe_people_reconcile result:", result, flush=True)
+    return result
 
-def rebuild_photo_people_base_safe(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
+
+def rebuild_photo_people_base_safe(
+    album_ctx: Dict[str, Any],
+    events: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Rebuild photo_people safely.
+
+    If events are supplied, only rebuild those event rows.
+    This avoids deleting/rebuilding the entire album during a one-event run.
+    """
     album_id = album_ctx["album_id"]
+    event_ids = _event_ids(events)
+
+    delete_event_filter = ""
+    face_event_filter = ""
+    delete_params: List[Any] = [album_id]
+    insert_params: List[Any] = [album_id]
+
+    if event_ids:
+        delete_event_filter = "AND album_event_id = ANY(%s::uuid[])"
+        face_event_filter = "AND f.album_event_id = ANY(%s::uuid[])"
+        delete_params.append(event_ids)
+        insert_params.append(event_ids)
 
     conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     DELETE FROM photo_people
-                    WHERE album_id = %s::uuid;
+                    WHERE album_id = %s::uuid
+                      {delete_event_filter};
+                """, tuple(delete_params))
 
+                cur.execute(f"""
                     INSERT INTO photo_people(
                         album_id,
                         album_event_id,
@@ -1580,17 +2231,20 @@ def rebuild_photo_people_base_safe(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
                             f.album_event_id,
                             f.photo_id,
                             f.person_id,
-                            ARRAY_AGG(f.id) AS face_ids,
+                            ARRAY_AGG(f.id ORDER BY f.face_quality_score DESC NULLS LAST) AS face_ids,
                             AVG(f.detection_confidence) AS conf
                         FROM faces f
+                        JOIN photos p ON p.id = f.photo_id
                         WHERE f.album_id = %s::uuid
+                          {face_event_filter}
                           AND f.person_id IS NOT NULL
+                          AND COALESCE(p.is_deleted, false) = false
                         GROUP BY f.album_id, f.album_event_id, f.photo_id, f.person_id
                     ),
                     enriched AS (
                         SELECT
                             b.*,
-                            ARRAY_REMOVE(ARRAY_AGG(o.person_id), b.person_id) AS co_person_ids
+                            ARRAY_REMOVE(ARRAY_AGG(DISTINCT o.person_id), b.person_id) AS co_person_ids
                         FROM base b
                         LEFT JOIN base o ON o.photo_id = b.photo_id
                         GROUP BY
@@ -1608,7 +2262,7 @@ def rebuild_photo_people_base_safe(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
                         e.person_id,
                         COALESCE(NULLIF(pe.display_name, ''), pe.default_name),
                         e.face_ids,
-                        e.co_person_ids,
+                        COALESCE(e.co_person_ids, ARRAY[]::uuid[]),
                         COALESCE(NULLIF(pe.display_name, ''), pe.default_name)
                             || ' appears in this photo with '
                             || COALESCE(array_length(e.co_person_ids, 1), 0)::text
@@ -1618,18 +2272,31 @@ def rebuild_photo_people_base_safe(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
                         now()
                     FROM enriched e
                     JOIN people pe ON pe.id = e.person_id;
-                """, (album_id, album_id))
+                """, tuple(insert_params))
     finally:
         conn.close()
 
-    row = db_one("""
+    count_params: List[Any] = [album_id]
+    count_event_filter = ""
+    if event_ids:
+        count_event_filter = "AND album_event_id = ANY(%s::uuid[])"
+        count_params.append(event_ids)
+
+    row = db_one(f"""
         SELECT COUNT(*) AS photo_people_rows
         FROM photo_people
-        WHERE album_id = %s::uuid;
-    """, (album_id,))
+        WHERE album_id = %s::uuid
+          {count_event_filter};
+    """, tuple(count_params))
 
-    return dict(row or {})
+    result = {
+        "event_scoped": bool(event_ids),
+        "event_ids": event_ids,
+        "photo_people_rows": int(row["photo_people_rows"] or 0) if row else 0,
+    }
 
+    print("rebuild_photo_people_base_safe result:", result, flush=True)
+    return result
 
 def crop_and_upload_missing_person_covers(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
     album_id = album_ctx["album_id"]
@@ -1797,25 +2464,6 @@ def build_duplicate_candidates(album_ctx: Dict[str, Any]) -> Dict[str, Any]:
     return {"candidates": len(candidates)}
 
 
-
-def assert_torch_gpu_ready(component: str):
-    import torch
-
-    print(f"{component} torch:", torch.__version__, flush=True)
-    print(f"{component} torch cuda:", torch.version.cuda, flush=True)
-    print(f"{component} cuda available:", torch.cuda.is_available(), flush=True)
-    print(f"{component} device count:", torch.cuda.device_count(), flush=True)
-
-    if torch.cuda.is_available():
-        print(f"{component} gpu name:", torch.cuda.get_device_name(0), flush=True)
-        return torch.device("cuda")
-
-    if STRICT_QWEN_GPU:
-        raise RuntimeError(f"STRICT_QWEN_GPU=true but CUDA is not available for {component}")
-
-    return torch.device("cpu")
-
-
 # ============================================================
 # QWEN
 # ============================================================
@@ -1840,7 +2488,6 @@ def load_qwen():
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     from qwen_vl_utils import process_vision_info
 
-    assert_torch_gpu_ready("Qwen")
     print(f"Loading Qwen model: {QWEN_MODEL_ID}", flush=True)
 
     processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
@@ -1852,12 +2499,6 @@ def load_qwen():
     )
     model.eval()
 
-    if STRICT_QWEN_GPU:
-        devices = {str(p.device) for p in model.parameters()}
-        print("Qwen parameter devices:", sorted(list(devices))[:10], flush=True)
-        if not any(d.startswith("cuda") for d in devices):
-            raise RuntimeError(f"Qwen model did not load on CUDA. Devices={sorted(list(devices))[:10]}")
-
     _QWEN_MODEL = model
     _QWEN_PROCESSOR = processor
     _PROCESS_VISION_INFO = process_vision_info
@@ -1866,123 +2507,66 @@ def load_qwen():
     return _QWEN_MODEL, _QWEN_PROCESSOR, _PROCESS_VISION_INFO
 
 
-
-def load_gemma():
-    global _GEMMA_MODEL, _GEMMA_PROCESSOR
-
-    if _GEMMA_MODEL is not None and _GEMMA_PROCESSOR is not None:
-        return _GEMMA_MODEL, _GEMMA_PROCESSOR
-
-    import torch
-    from transformers import AutoProcessor, BitsAndBytesConfig
-
-    try:
-        # Gemma 4 12B model card currently shows this class.
-        from transformers import AutoModelForMultimodalLM as GemmaModelClass
-    except Exception:
-        # Fallback for other recent Transformers builds / smaller variants.
-        from transformers import AutoModelForImageTextToText as GemmaModelClass
-
-    assert_torch_gpu_ready("Gemma")
-    print(
-        f"Loading Gemma model: {GEMMA_MODEL_ID}, "
-        f"quantization={GEMMA_QUANTIZATION}, "
-        f"attn={GEMMA_ATTN_IMPLEMENTATION}",
-        flush=True,
-    )
-
-    processor = AutoProcessor.from_pretrained(
-        GEMMA_MODEL_ID,
-        trust_remote_code=True,
-    )
-
-    model_kwargs: Dict[str, Any] = {
-        "device_map": "auto",
-        "trust_remote_code": True,
-    }
-
-    if GEMMA_ATTN_IMPLEMENTATION:
-        model_kwargs["attn_implementation"] = GEMMA_ATTN_IMPLEMENTATION
-
-    if GEMMA_QUANTIZATION == "4bit":
-        # Keep non-quantized modules such as norms / vision adapter in floating point.
-        # Without this, some Transformers+bitsandbytes builds can leave a Byte path
-        # that crashes LayerNorm: "LayerNormKernelImpl" not implemented for 'Byte'.
-        model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-    elif GEMMA_QUANTIZATION == "8bit":
-        model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_8bit=True,
-        )
-    else:
-        # Transformers 5 uses dtype; older builds may still expect torch_dtype.
-        model_kwargs["dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-
-    try:
-        model = GemmaModelClass.from_pretrained(
-            GEMMA_MODEL_ID,
-            **model_kwargs,
-        )
-    except TypeError:
-        if "dtype" in model_kwargs:
-            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
-        model = GemmaModelClass.from_pretrained(
-            GEMMA_MODEL_ID,
-            **model_kwargs,
-        )
-
-    model.eval()
-
-    if STRICT_QWEN_GPU:
-        devices = {str(p.device) for p in model.parameters()}
-        print("Gemma parameter devices:", sorted(list(devices))[:10], flush=True)
-        if not any(d.startswith("cuda") for d in devices):
-            raise RuntimeError(f"Gemma model did not load on CUDA. Devices={sorted(list(devices))[:10]}")
-
-    _GEMMA_MODEL = model
-    _GEMMA_PROCESSOR = processor
-
-    print("Gemma loaded", flush=True)
-    return _GEMMA_MODEL, _GEMMA_PROCESSOR
-
-
-def image_text_inference_batch_size() -> int:
-    # Gemma-only runtime. qwen_* DB/status names remain for compatibility.
-    return max(1, GEMMA_INFERENCE_BATCH_SIZE)
-
-
 def qwen_prompt() -> str:
     return """
 Return only valid minified JSON. No markdown. No explanation.
 The image may have green boxes labeled Person 1, Person 2, etc.
-Use only visible labels. Do not identify real people. Do not invent details.
-If uncertain, use "uncertain" or 0.
+CRITICAL PERSON RULES:
+- Use ONLY the visible green labels exactly as written: "Person 1", "Person 2", etc.
+- Do NOT identify real people, celebrities, bride/groom names, family names, or infer identity.
+- Do NOT create keys like "bride", "groom", "man", "woman", or real names inside people. The people object keys must be the exact visible Person labels only.
+- You may describe visible role_guess such as bride, groom, guest, child, family, priest, performer, unknown, but this is only a visual guess.
+- Include only labeled people visible in the image. If a labeled person is mostly hidden, still include them with uncertainty.
+- Do not invent unseen details. If uncertain, use "uncertain", [], false, or 0.
+
+Goal: produce rich searchable wedding/event metadata for photo gallery search, culling, album selection, and person-specific search.
 
 Schema:
 {
-  "caption": "",
-  "scene": "",
+  "caption": "one natural sentence, rich but concise",
+  "scene": "2-4 sentences describing the visible moment, setting, action, people, decor, mood, and composition",
+  "event_type_guess": "wedding|reception|haldi|sangeeth|engagement|pre-wedding|ceremony|portrait|group_photo|dance|ritual|party|unknown",
+  "moment_keywords": ["short visible moment tags"],
+  "action_keywords": ["standing","smiling","dancing","walking","ritual","posing"],
+  "emotion_keywords": ["happy","serious","joyful","emotional","calm","uncertain"],
+  "photo_style": "candid|posed|portrait|group|wide_scene|detail_shot|action|ceremony|uncertain",
+  "indoor_outdoor": "indoor|outdoor|mixed|uncertain",
+  "venue_type": "mandap|stage|hall|garden|temple|home|street|beach|banquet|unknown",
+  "time_of_day_guess": "day|night|evening|indoor_lighting|uncertain",
+  "lighting_keywords": ["natural light","flash","warm lights","backlit","low light","harsh light","soft light"],
+  "color_palette": ["visible dominant colors"],
+  "outfit_keywords": ["saree","lehenga","sherwani","suit","kurta","dress","traditional","western"],
+  "object_keywords": ["visible important objects"],
   "decoration_present": true,
-  "decoration_keywords": "",
+  "decoration_keywords": "visible stage, flowers, lights, mandap, backdrop, garlands, seating, props",
+  "composition_keywords": ["close-up","full body","centered","wide","symmetry","crowded","clean background"],
+  "technical_issues": ["blur","closed eyes","bad crop","overexposed","underexposed","blocked face","noise","none"],
   "background_quality": 0,
   "frame_clarity": 0,
+  "album_worthy_score": 0,
+  "album_worthy_reason": "specific visible reason for album/culling decision",
+  "print_worthy_score": 0,
+  "duplicate_risk": "low|medium|high|uncertain",
+  "best_use": "hero_album|album_candidate|person_cover|group_memory|detail_memory|social_media|reject|uncertain",
   "camera_gaze": {
     "overall": "all|some|none|uncertain",
     "people": {
-      "Person 1": "looking_at_camera|not_looking|uncertain"
+      "Person 1": "looking_at_camera|not_looking|eyes_closed|partially_visible|uncertain"
     }
   },
-  "album_worthy_score": 0,
-  "album_worthy_reason": "",
+  "relationships": [
+    {
+      "people": ["Person 1", "Person 2"],
+      "relationship_or_interaction": "standing together|hugging|ritual interaction|dancing together|posing together|uncertain"
+    }
+  ],
   "people": {
     "Person 1": {
-      "visible_keywords": "",
+      "visible_keywords": "rich visible description of this labeled person only",
+      "role_guess": "bride|groom|guest|family|child|priest|performer|unknown",
+      "clothing_keywords": "visible clothing, outfit type, texture, pattern",
+      "clothing_colors": ["visible clothing colors"],
+      "accessory_keywords": "watch, glasses, turban, dupatta, bouquet, phone, etc.",
       "jewelry_count": {
         "bangles": 0,
         "necklace": 0,
@@ -1991,25 +2575,36 @@ Schema:
         "head_jewelry": 0,
         "other": 0
       },
-      "jewelry_keywords": "",
-      "photo_quality_score": 0
+      "jewelry_keywords": "visible jewelry details only",
+      "pose_keywords": "standing, sitting, dancing, walking, blessing, holding hands, etc.",
+      "expression": "smiling|laughing|serious|emotional|eyes_closed|neutral|uncertain",
+      "face_visibility": "clear|partial|side_face|back_view|blocked|blurred|uncertain",
+      "body_visibility": "face_only|upper_body|full_body|partial|uncertain",
+      "camera_gaze": "looking_at_camera|not_looking|eyes_closed|partially_visible|uncertain",
+      "occlusion_keywords": "blocked by person/object/none/uncertain",
+      "personal_photo_quality_score": 0,
+      "photo_quality_score": 0,
+      "person_cover_score": 0,
+      "search_phrases": ["useful person-specific search phrases"]
     }
   },
-  "search_text": ""
+  "search_text": "dense searchable sentence including visible people labels, clothing, decor, action, mood, venue, style, colors, quality, and likely search phrases"
 }
 
 Rules:
+- Return exactly one JSON object matching the schema. No trailing commas.
 - Scores are integers from 0 to 10.
-- frame_clarity means sharp, clear, good for printing/framing.
+- frame_clarity means sharp, clear, face/detail visibility, good for printing/framing.
 - background_quality means clean, pretty, visually pleasing background.
 - album_worthy_score means whether this photo deserves to be in a wow wedding album.
+- print_worthy_score means whether this photo would look good printed large.
+- person_cover_score means whether that labeled person could use this as a profile/cover photo.
 - decoration_present means visible stage, flowers, lights, mandap, backdrop, decor, or venue decoration.
-- Count jewelry by category only.
-- Include only visible labeled people.
-- Keep all strings short.
-- No trailing commas.
+- Count jewelry by category only when visible; do not guess hidden jewelry.
+- Keep arrays short: usually 3-8 items.
+- Keep text useful for search, not poetic.
+- Prefer visible evidence over assumptions.
 """
-
 
 def extract_json(text: str) -> Dict[str, Any]:
     repair_json = install_json_repair_if_needed()
@@ -2052,23 +2647,79 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Qwen output is not dict")
 
-    caption = str(data.get("caption") or "")[:300]
-    scene = str(data.get("scene") or "")[:500]
-    search_text = str(data.get("search_text") or "")[:3000]
+    def s(value: Any, limit: int = 500) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(x) for x in value if x is not None)[:limit]
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)[:limit]
+        return str(value)[:limit]
 
-    decoration_present = bool(data.get("decoration_present") or False)
-    decoration_keywords = str(data.get("decoration_keywords") or "")[:500]
+    def str_list(value: Any, limit_each: int = 80, max_items: int = 12) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [p.strip() for p in re.split(r"[,|;]", value) if p.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            parts = [str(x).strip() for x in value if str(x).strip()]
+        else:
+            parts = [str(value).strip()] if str(value).strip() else []
+        out = []
+        seen = set()
+        for part in parts:
+            part = part[:limit_each]
+            key = part.lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(part)
+            if len(out) >= max_items:
+                break
+        return out
+
+    def boolish(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "yes", "1", "present", "visible"}
+        return bool(value)
+
+    caption = s(data.get("caption"), 500)
+    scene = s(data.get("scene") or data.get("detailed_description"), 1500)
+    search_text = s(data.get("search_text"), 5000)
+
+    event_type_guess = s(data.get("event_type_guess"), 80) or "unknown"
+    photo_style = s(data.get("photo_style"), 80) or "uncertain"
+    indoor_outdoor = s(data.get("indoor_outdoor"), 80) or "uncertain"
+    venue_type = s(data.get("venue_type"), 120) or "unknown"
+    time_of_day_guess = s(data.get("time_of_day_guess"), 80) or "uncertain"
+    best_use = s(data.get("best_use"), 120) or "uncertain"
+    duplicate_risk = s(data.get("duplicate_risk"), 80) or "uncertain"
+
+    moment_keywords = str_list(data.get("moment_keywords"))
+    action_keywords = str_list(data.get("action_keywords"))
+    emotion_keywords = str_list(data.get("emotion_keywords"))
+    lighting_keywords = str_list(data.get("lighting_keywords"))
+    color_palette = str_list(data.get("color_palette"))
+    outfit_keywords = str_list(data.get("outfit_keywords"))
+    object_keywords = str_list(data.get("object_keywords"))
+    composition_keywords = str_list(data.get("composition_keywords"))
+    technical_issues = str_list(data.get("technical_issues"))
+
+    decoration_present = boolish(data.get("decoration_present"))
+    decoration_keywords = s(data.get("decoration_keywords"), 1000)
 
     background_quality = clamp_score(data.get("background_quality"))
     frame_clarity = clamp_score(data.get("frame_clarity"))
     album_worthy_score = clamp_score(data.get("album_worthy_score"))
-    album_worthy_reason = str(data.get("album_worthy_reason") or "")[:500]
+    album_worthy_reason = s(data.get("album_worthy_reason"), 1000)
+    print_worthy_score = clamp_score(data.get("print_worthy_score"))
 
     camera_gaze = data.get("camera_gaze") or {}
     if not isinstance(camera_gaze, dict):
         camera_gaze = {}
 
-    gaze_overall = str(camera_gaze.get("overall") or "uncertain")
+    gaze_overall = s(camera_gaze.get("overall") or "uncertain", 80)
     gaze_people = camera_gaze.get("people") or {}
     if not isinstance(gaze_people, dict):
         gaze_people = {}
@@ -2078,10 +2729,14 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
         people_obj = {}
 
     normalized_people = {}
+    person_search_chunks: List[str] = []
 
     for label, value in people_obj.items():
+        # CRITICAL: Preserve existing person-name/person-id logic.
+        # Downstream save_qwen_photo maps ONLY exact labels like "Person 12" to DB person IDs.
+        # Never accept real names, role names, or arbitrary keys from the model here.
         label = str(label).strip()
-        if not label.startswith("Person "):
+        if not re.fullmatch(r"Person \d+", label):
             continue
 
         if not isinstance(value, dict):
@@ -2100,21 +2755,101 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
             "other": safe_int(jc.get("other")),
         }
 
+        visible_keywords = s(value.get("visible_keywords"), 1000)
+        role_guess = s(value.get("role_guess") or "unknown", 80)
+        clothing_keywords = s(value.get("clothing_keywords"), 1000)
+        clothing_colors = str_list(value.get("clothing_colors"), max_items=8)
+        accessory_keywords = s(value.get("accessory_keywords"), 1000)
+        jewelry_keywords = s(value.get("jewelry_keywords"), 1000)
+        pose_keywords = s(value.get("pose_keywords"), 500)
+        expression = s(value.get("expression") or "uncertain", 80)
+        face_visibility = s(value.get("face_visibility") or "uncertain", 80)
+        body_visibility = s(value.get("body_visibility") or "uncertain", 80)
+        gaze = s(value.get("camera_gaze") or gaze_people.get(label) or "uncertain", 80)
+        occlusion_keywords = s(value.get("occlusion_keywords"), 500)
+        search_phrases = str_list(value.get("search_phrases"), limit_each=120, max_items=10)
+        photo_quality_score = clamp_score(value.get("photo_quality_score"))
+        personal_photo_quality_score = clamp_score(value.get("personal_photo_quality_score") or photo_quality_score)
+        person_cover_score = clamp_score(value.get("person_cover_score"))
+
         normalized_people[label] = {
-            "visible_keywords": str(value.get("visible_keywords") or "")[:500],
+            "visible_keywords": visible_keywords,
+            "role_guess": role_guess,
+            "clothing_keywords": clothing_keywords,
+            "clothing_colors": clothing_colors,
+            "accessory_keywords": accessory_keywords,
             "jewelry_count": jewelry_count,
-            "jewelry_keywords": str(value.get("jewelry_keywords") or "")[:500],
-            "camera_gaze": str(gaze_people.get(label) or "uncertain"),
-            "photo_quality_score": clamp_score(value.get("photo_quality_score")),
+            "jewelry_keywords": jewelry_keywords,
+            "pose_keywords": pose_keywords,
+            "expression": expression,
+            "face_visibility": face_visibility,
+            "body_visibility": body_visibility,
+            "camera_gaze": gaze,
+            "occlusion_keywords": occlusion_keywords,
+            "personal_photo_quality_score": personal_photo_quality_score,
+            "photo_quality_score": photo_quality_score,
+            "person_cover_score": person_cover_score,
+            "search_phrases": search_phrases,
         }
 
+        person_search_chunks.append(
+            "; ".join([
+                label,
+                f"role={role_guess}",
+                visible_keywords,
+                f"clothing={clothing_keywords}",
+                f"colors={', '.join(clothing_colors)}",
+                f"accessories={accessory_keywords}",
+                f"jewelry={jewelry_keywords}",
+                f"pose={pose_keywords}",
+                f"expression={expression}",
+                f"face_visibility={face_visibility}",
+                f"body_visibility={body_visibility}",
+                f"camera_gaze={gaze}",
+                f"cover_score={person_cover_score}/10",
+                f"search_phrases={', '.join(search_phrases)}",
+            ])
+        )
+
+    relationships_raw = data.get("relationships") or []
+    relationships: List[Dict[str, Any]] = []
+    if isinstance(relationships_raw, list):
+        valid_labels = set(normalized_people.keys())
+        for rel in relationships_raw[:12]:
+            if not isinstance(rel, dict):
+                continue
+            rel_people = [p for p in str_list(rel.get("people"), max_items=6) if p in valid_labels]
+            if len(rel_people) < 2:
+                continue
+            relationships.append({
+                "people": rel_people,
+                "relationship_or_interaction": s(rel.get("relationship_or_interaction") or rel.get("interaction"), 300) or "uncertain",
+            })
+
     quality_keywords = (
+        f"event_type={event_type_guess}; "
+        f"photo_style={photo_style}; "
+        f"indoor_outdoor={indoor_outdoor}; "
+        f"venue={venue_type}; "
+        f"time={time_of_day_guess}; "
+        f"moment={', '.join(moment_keywords)}; "
+        f"actions={', '.join(action_keywords)}; "
+        f"emotions={', '.join(emotion_keywords)}; "
+        f"lighting={', '.join(lighting_keywords)}; "
+        f"colors={', '.join(color_palette)}; "
+        f"outfits={', '.join(outfit_keywords)}; "
+        f"objects={', '.join(object_keywords)}; "
+        f"composition={', '.join(composition_keywords)}; "
+        f"technical_issues={', '.join(technical_issues)}; "
         f"decoration_present={decoration_present}; "
         f"decoration={decoration_keywords}; "
         f"background_quality={background_quality}/10; "
         f"frame_clarity={frame_clarity}/10; "
         f"camera_gaze={gaze_overall}; "
         f"album_worthy_score={album_worthy_score}/10; "
+        f"print_worthy_score={print_worthy_score}/10; "
+        f"duplicate_risk={duplicate_risk}; "
+        f"best_use={best_use}; "
         f"album_worthy_reason={album_worthy_reason}"
     )
 
@@ -2123,7 +2858,8 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
         scene,
         search_text,
         quality_keywords,
-    ]).strip()
+        " | ".join(person_search_chunks),
+    ]).strip()[:8000]
 
     return {
         "photo": {
@@ -2140,12 +2876,28 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
             "camera_gaze_overall": gaze_overall,
             "album_worthy_score": album_worthy_score,
             "album_worthy_reason": album_worthy_reason,
+            "print_worthy_score": print_worthy_score,
+            "event_type_guess": event_type_guess,
+            "moment_keywords": moment_keywords,
+            "action_keywords": action_keywords,
+            "emotion_keywords": emotion_keywords,
+            "photo_style": photo_style,
+            "indoor_outdoor": indoor_outdoor,
+            "venue_type": venue_type,
+            "time_of_day_guess": time_of_day_guess,
+            "lighting_keywords": lighting_keywords,
+            "color_palette": color_palette,
+            "outfit_keywords": outfit_keywords,
+            "object_keywords": object_keywords,
+            "composition_keywords": composition_keywords,
+            "technical_issues": technical_issues,
+            "duplicate_risk": duplicate_risk,
+            "best_use": best_use,
         },
         "people_map": normalized_people,
-        "relationships": [],
+        "relationships": relationships,
         "raw": data,
     }
-
 
 def patch_annotated_keys(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> None:
     album_id = album_ctx["album_id"]
@@ -2364,7 +3116,7 @@ def annotate_photo_with_faces(photo: Dict[str, Any], faces: List[Dict[str, Any]]
     return make_qwen_image(ann), faces
 
 
-def _qwen_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
+def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
     import torch
 
     model, processor, process_vision_info = load_qwen()
@@ -2433,350 +3185,6 @@ def _qwen_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
     return [normalize_qwen_data(extract_json(o)) for o in outs]
 
 
-
-
-def _gemma_response_to_text(processor: Any, response: Any) -> str:
-    try:
-        parsed = processor.parse_response(response) if hasattr(processor, "parse_response") else response
-    except Exception:
-        parsed = response
-
-    if isinstance(parsed, str):
-        return parsed
-
-    if isinstance(parsed, dict):
-        for key in ("content", "response", "text", "answer"):
-            value = parsed.get(key)
-            if isinstance(value, str):
-                return value
-        return json.dumps(parsed, ensure_ascii=False)
-
-    if isinstance(parsed, list):
-        parts = []
-        for item in parsed:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                value = item.get("text") or item.get("content")
-                if isinstance(value, str):
-                    parts.append(value)
-        if parts:
-            return "\n".join(parts)
-
-    return str(parsed or "")
-
-
-def _model_device_and_dtype(model: Any) -> Tuple[Any, Any]:
-    import torch
-
-    try:
-        device = next(model.parameters()).device
-    except Exception:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # IMPORTANT:
-    # For bitsandbytes 4-bit models, model.dtype can be torch.uint8 because
-    # quantized weights are stored as bytes. That dtype must NEVER be used for
-    # Gemma pixel/image tensors. LayerNorm requires floating point activations.
-    raw_model_dtype = getattr(model, "dtype", None)
-
-    if raw_model_dtype is not None:
-        try:
-            if torch.empty((), dtype=raw_model_dtype).dtype.is_floating_point:
-                return device, raw_model_dtype
-        except Exception:
-            pass
-
-    # Gemma 4-bit compute dtype is bf16 in load_gemma(); use bf16 activations
-    # on CUDA when available, otherwise fp32.
-    model_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    return device, model_dtype
-
-
-def _move_inputs_to_model(inputs: Any, model: Any) -> Dict[str, Any]:
-    """
-    Move Gemma processor BatchFeature/dict to model device and force image-like
-    tensors to a floating activation dtype.
-
-    This is intentionally aggressive because Gemma 4 + bitsandbytes 4-bit can
-    expose uint8/Byte tensors either from the processor output or from model dtype
-    metadata. LayerNorm cannot run on Byte.
-    """
-    import torch
-
-    global _GEMMA_DTYPE_DEBUG_PRINTED
-
-    device, model_dtype = _model_device_and_dtype(model)
-
-    # These keys must stay integer/bool because they are token IDs, positions,
-    # masks, cache indices, or grid indices.
-    exact_integer_or_bool_keys = {
-        "input_ids",
-        "attention_mask",
-        "token_type_ids",
-        "position_ids",
-        "cache_position",
-        "image_token_mask",
-        "cross_attention_mask",
-        "pixel_attention_mask",
-    }
-
-    integer_name_parts = (
-        "mask", "grid", "ids", "position", "cache", "index", "offset",
-    )
-    float_name_parts = (
-        "pixel", "image", "images", "video", "vision", "values", "embeds",
-    )
-
-    def should_keep_integer(key_l: str, value: Any) -> bool:
-        if key_l in exact_integer_or_bool_keys:
-            return True
-        if any(part in key_l for part in integer_name_parts):
-            return True
-        if torch.is_tensor(value) and value.dtype == torch.bool:
-            return True
-        return False
-
-    def should_force_float(key_l: str, value: Any) -> bool:
-        if not torch.is_tensor(value):
-            return False
-        if value.dtype.is_floating_point:
-            return True
-        if any(part in key_l for part in float_name_parts):
-            return True
-        # Image/video tensors are usually rank 4/5. If they are uint8, they must
-        # become floating point before entering Gemma vision layers.
-        if value.dtype == torch.uint8 and value.ndim >= 3:
-            return True
-        return False
-
-    def move_one(key: str, value: Any) -> Any:
-        if not torch.is_tensor(value):
-            return value.to(device) if hasattr(value, "to") else value
-
-        key_l = key.lower()
-
-        if should_keep_integer(key_l, value):
-            return value.to(device=device)
-
-        if should_force_float(key_l, value):
-            return value.to(device=device, dtype=model_dtype)
-
-        # Unknown tensor. Keep integers as integers unless they look like image
-        # tensors above. This avoids corrupting token IDs.
-        return value.to(device=device)
-
-    def walk(prefix: str, value: Any) -> Any:
-        if isinstance(value, dict):
-            return {k: walk(f"{prefix}.{k}" if prefix else str(k), v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return type(value)(walk(f"{prefix}.{i}", v) for i, v in enumerate(value))
-        return move_one(prefix, value)
-
-    if isinstance(inputs, dict):
-        moved = walk("", inputs)
-    elif hasattr(inputs, "items"):
-        moved = {k: walk(str(k), v) for k, v in inputs.items()}
-    else:
-        moved = inputs.to(device)
-
-    def tensor_report(obj: Any, prefix: str = "") -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        if torch.is_tensor(obj):
-            out[prefix or "<root>"] = {
-                "shape": list(obj.shape),
-                "dtype": str(obj.dtype),
-                "device": str(obj.device),
-            }
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                out.update(tensor_report(v, f"{prefix}.{k}" if prefix else str(k)))
-        elif isinstance(obj, (list, tuple)):
-            for i, v in enumerate(obj):
-                out.update(tensor_report(v, f"{prefix}.{i}"))
-        return out
-
-    report = tensor_report(moved)
-    if GEMMA_DEBUG_INPUT_DTYPES or not _GEMMA_DTYPE_DEBUG_PRINTED:
-        _GEMMA_DTYPE_DEBUG_PRINTED = True
-        print(
-            "Gemma input tensor dtypes: " + json.dumps(report, default=str),
-            flush=True,
-        )
-
-    # Hard guard: fail before generate with a useful key if any non-index Byte
-    # tensor remains. This is better than the opaque LayerNorm Byte error.
-    bad = {
-        k: v for k, v in report.items()
-        if v.get("dtype") == "torch.uint8"
-        and not any(part in k.lower() for part in integer_name_parts)
-    }
-    if bad:
-        raise RuntimeError(f"Gemma input still contains non-index uint8 tensors after move: {bad}")
-
-    return moved
-
-def _gemma_messages_for_image(image_path: Path) -> List[Dict[str, Any]]:
-    return [
-        {
-            "role": "user",
-            "content": [
-                # Gemma HF examples use url for image paths. Local paths work here.
-                {"type": "image", "url": str(image_path)},
-                {"type": "text", "text": qwen_prompt()},
-            ],
-        }
-    ]
-
-
-def _gemma_apply_chat_template(processor: Any, conversations: List[List[Dict[str, Any]]]) -> Any:
-    # Newer Transformers versions warn when processor.__call__ kwargs such as
-    # padding are passed directly through apply_chat_template. Put them under
-    # processor_kwargs when supported.
-    template_kwargs: Dict[str, Any] = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "add_generation_prompt": True,
-        "processor_kwargs": {"padding": True},
-    }
-
-    try:
-        return processor.apply_chat_template(
-            conversations,
-            enable_thinking=GEMMA_ENABLE_THINKING,
-            **template_kwargs,
-        )
-    except TypeError:
-        try:
-            # Some Transformers versions do not accept enable_thinking.
-            return processor.apply_chat_template(
-                conversations,
-                **template_kwargs,
-            )
-        except TypeError:
-            # Older Transformers versions do not accept processor_kwargs.
-            legacy_kwargs = dict(template_kwargs)
-            legacy_kwargs.pop("processor_kwargs", None)
-            legacy_kwargs["padding"] = True
-            return processor.apply_chat_template(
-                conversations,
-                **legacy_kwargs,
-            )
-
-
-def _is_cuda_oom(exc: BaseException) -> bool:
-    text = repr(exc).lower()
-    return (
-        "cuda out of memory" in text
-        or "outofmemoryerror" in text
-        or "cublas_status_alloc_failed" in text
-        or "cuda error: out of memory" in text
-    )
-
-
-def _gemma_describe_batch_once(image_paths: List[Path]) -> List[Dict[str, Any]]:
-    import torch
-
-    model, processor = load_gemma()
-
-    conversations = [_gemma_messages_for_image(path) for path in image_paths]
-    inputs = _gemma_apply_chat_template(processor, conversations)
-    inputs = _move_inputs_to_model(inputs, model)
-
-    # With padding=True, generate returns the padded prompt plus generated tokens.
-    # Trim by the padded input width, not per-row attention length.
-    input_len = int(inputs["input_ids"].shape[-1])
-
-    try:
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=GEMMA_MAX_NEW_TOKENS,
-                do_sample=False,
-            )
-    except Exception as e:
-        print("Gemma generate failed with traceback:", repr(e), flush=True)
-        print(traceback.format_exc(), flush=True)
-        raise
-
-    generated = [out[input_len:] for out in outputs]
-    texts = processor.batch_decode(
-        generated,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-
-    results = []
-    for text in texts:
-        parsed_text = _gemma_response_to_text(processor, text)
-        results.append(normalize_qwen_data(extract_json(parsed_text)))
-
-    del inputs, outputs, generated
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return results
-
-
-def _gemma_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
-    """
-    True Gemma batch inference.
-
-    Uses the full batch to maximize GPU utilization. If the batch is too large
-    for the GPU and GEMMA_SPLIT_BATCH_ON_OOM=true, it recursively splits the
-    batch so the job keeps progressing instead of failing the entire run.
-    """
-    if not image_paths:
-        return []
-
-    started = time.time()
-    print(
-        f"Gemma batch start: images={len(image_paths)}, "
-        f"max_new_tokens={GEMMA_MAX_NEW_TOKENS}, "
-        f"image_max_side={GEMMA_IMAGE_MAX_SIDE}",
-        flush=True,
-    )
-
-    try:
-        result = _gemma_describe_batch_once(image_paths)
-        print(
-            f"Gemma batch done: images={len(image_paths)}, seconds={round(time.time() - started, 2)}",
-            flush=True,
-        )
-        return result
-    except RuntimeError as e:
-        if GEMMA_SPLIT_BATCH_ON_OOM and _is_cuda_oom(e) and len(image_paths) > 1:
-            import torch
-
-            print(
-                f"Gemma batch OOM; splitting batch: images={len(image_paths)}, error={repr(e)}",
-                flush=True,
-            )
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            mid = len(image_paths) // 2
-            return _gemma_describe_batch_impl(image_paths[:mid]) + _gemma_describe_batch_impl(image_paths[mid:])
-
-        raise
-
-
-def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
-    """
-    Backward-compatible function name.
-
-    Runtime is Gemma-only now. DB/status fields still say qwen_* so the rest
-    of your existing schema and UI do not need to change.
-    """
-    print(
-        f"Image-to-text provider=gemma, images={len(image_paths)}, batch_size={GEMMA_INFERENCE_BATCH_SIZE}",
-        flush=True,
-    )
-    return _gemma_describe_batch_impl(image_paths)
-
 def get_label_to_id(album_ctx: Dict[str, Any]) -> Dict[str, str]:
     people = db_all("""
         SELECT id, person_number
@@ -2843,32 +3251,71 @@ def save_qwen_photo(
                 ))
 
                 for label, person_data in people_map.items():
+                    # CRITICAL: Do not change this mapping. label_to_id maps exact
+                    # "Person N" labels from the annotated image to DB person IDs.
                     pid = label_to_id.get(label)
                     if not pid:
                         continue
 
                     visible_keywords = person_data.get("visible_keywords", "")
+                    role_guess = person_data.get("role_guess", "unknown")
+                    clothing_keywords = person_data.get("clothing_keywords", "")
+                    clothing_colors = person_data.get("clothing_colors", [])
+                    accessory_keywords = person_data.get("accessory_keywords", "")
                     jewelry_keywords = person_data.get("jewelry_keywords", "")
                     jewelry_count = person_data.get("jewelry_count", {})
+                    pose_keywords = person_data.get("pose_keywords", "")
+                    expression = person_data.get("expression", "uncertain")
+                    face_visibility = person_data.get("face_visibility", "uncertain")
+                    body_visibility = person_data.get("body_visibility", "uncertain")
                     gaze = person_data.get("camera_gaze", "uncertain")
+                    occlusion_keywords = person_data.get("occlusion_keywords", "")
                     quality_score = person_data.get("photo_quality_score", 0)
+                    personal_quality_score = person_data.get("personal_photo_quality_score", quality_score)
+                    person_cover_score = person_data.get("person_cover_score", 0)
+                    search_phrases = person_data.get("search_phrases", [])
 
                     person_search_text = (
-                        f"{label}; {visible_keywords}; "
+                        f"{label}; "
+                        f"role={role_guess}; "
+                        f"{visible_keywords}; "
+                        f"clothing={clothing_keywords}; "
+                        f"colors={clothing_colors}; "
+                        f"accessories={accessory_keywords}; "
                         f"jewelry={jewelry_keywords}; "
                         f"jewelry_count={jewelry_count}; "
+                        f"pose={pose_keywords}; "
+                        f"expression={expression}; "
+                        f"face_visibility={face_visibility}; "
+                        f"body_visibility={body_visibility}; "
                         f"camera_gaze={gaze}; "
-                        f"photo_quality_score={quality_score}/10"
-                    )
+                        f"occlusion={occlusion_keywords}; "
+                        f"photo_quality_score={quality_score}/10; "
+                        f"personal_photo_quality_score={personal_quality_score}/10; "
+                        f"person_cover_score={person_cover_score}/10; "
+                        f"search_phrases={search_phrases}"
+                    )[:4000]
 
                     person_json = {
                         "person_label": label,
                         "description": visible_keywords,
                         "search_text": person_search_text,
+                        "role_guess": role_guess,
+                        "clothing_keywords": clothing_keywords,
+                        "clothing_colors": clothing_colors,
+                        "accessory_keywords": accessory_keywords,
                         "jewelry_count": jewelry_count,
                         "jewelry_keywords": jewelry_keywords,
+                        "pose_keywords": pose_keywords,
+                        "expression": expression,
+                        "face_visibility": face_visibility,
+                        "body_visibility": body_visibility,
                         "camera_gaze": gaze,
+                        "occlusion_keywords": occlusion_keywords,
                         "photo_quality_score": quality_score,
+                        "personal_photo_quality_score": personal_quality_score,
+                        "person_cover_score": person_cover_score,
+                        "search_phrases": search_phrases,
                         "confidence": 0.75,
                     }
 
@@ -2891,7 +3338,6 @@ def save_qwen_photo(
                     ))
     finally:
         conn.close()
-
 
 def mark_qwen_failed(photo: Dict[str, Any], err: Exception) -> None:
     execute_sql_best_effort("""
@@ -2945,7 +3391,7 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
     fail = 0
     errors = []
 
-    for batch in chunks(rows, image_text_inference_batch_size()):
+    for batch in chunks(rows, QWEN_INFERENCE_BATCH_SIZE):
         prepared = []
 
         for photo in batch:
@@ -2974,25 +3420,17 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
                     errors.append({"file_name": photo.get("file_name"), "error": repr(e)})
 
         except Exception as batch_err:
-            print("GEMMA BATCH FAILED:", repr(batch_err), flush=True)
+            print("QWEN BATCH FAILED, retrying individually:", repr(batch_err), flush=True)
 
-            if IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE and len(prepared) > 1:
-                print("Retrying Gemma batch individually because IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE=true", flush=True)
-                for photo, qwen_img in prepared:
-                    try:
-                        data = qwen_describe_batch([qwen_img])[0]
-                        save_qwen_photo(photo, data, label_to_id, event_by_id=event_by_id)
-                        ok += 1
-                    except Exception as e:
-                        fail += 1
-                        mark_qwen_failed(photo, e)
-                        errors.append({"file_name": photo.get("file_name"), "error": repr(e)})
-            else:
-                # Avoid the repeated failure loop from the old code. Mark this batch failed once.
-                for photo, _qwen_img in prepared:
+            for photo, qwen_img in prepared:
+                try:
+                    data = qwen_describe_batch([qwen_img])[0]
+                    save_qwen_photo(photo, data, label_to_id, event_by_id=event_by_id)
+                    ok += 1
+                except Exception as e:
                     fail += 1
-                    mark_qwen_failed(photo, batch_err)
-                    errors.append({"file_name": photo.get("file_name"), "error": repr(batch_err)})
+                    mark_qwen_failed(photo, e)
+                    errors.append({"file_name": photo.get("file_name"), "error": repr(e)})
 
     result = {"rows": len(rows), "ok": ok, "failed": fail, "errors": errors[:25]}
     print("Qwen result:", result, flush=True)
@@ -3009,9 +3447,8 @@ def load_text_embed_model():
         return _TEXT_EMBED_MODEL
 
     from sentence_transformers import SentenceTransformer
-    device = assert_torch_gpu_ready("Text embeddings")
-    _TEXT_EMBED_MODEL = SentenceTransformer(TEXT_EMBED_MODEL_ID, device=str(device))
-    print(f"Text embedding model loaded: {TEXT_EMBED_MODEL_ID} on {device}", flush=True)
+    _TEXT_EMBED_MODEL = SentenceTransformer(TEXT_EMBED_MODEL_ID)
+    print(f"Text embedding model loaded: {TEXT_EMBED_MODEL_ID}", flush=True)
     return _TEXT_EMBED_MODEL
 
 
@@ -3610,12 +4047,13 @@ def load_image_embed_model():
     if _IMAGE_EMBED_MODEL is not None and _IMAGE_EMBED_PROCESSOR is not None:
         return _IMAGE_EMBED_MODEL, _IMAGE_EMBED_PROCESSOR
 
+    import torch
     from transformers import CLIPModel, CLIPProcessor
 
     print(f"Loading image embedding model: {IMAGE_EMBED_MODEL_ID}", flush=True)
     processor = CLIPProcessor.from_pretrained(IMAGE_EMBED_MODEL_ID)
     model = CLIPModel.from_pretrained(IMAGE_EMBED_MODEL_ID)
-    device = assert_torch_gpu_ready("Image embeddings")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
     _IMAGE_EMBED_MODEL = model
@@ -4057,49 +4495,194 @@ def process_culling_mode(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
 
     raise ValueError(f"Unsupported culling mode: {mode}")
 
+
 # ============================================================
-# MAIN PIPELINE
+# QWEN ENQUEUE FOR SPLIT WORKER
 # ============================================================
 
-def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
-    if payload.get("full_mode", False) or payload.get("qwen_full_mode", False):
-        return {
-            "ingest": False,
-            "compress": False,
-            "face_index": False,
-            "safe_people_reconcile": False,
-            "rebuild_people": False,
-            "qwen": True,
-            "embeddings": True,
-            "culling": bool(payload.get("culling_enabled", payload.get("run_culling", True))),
-            "cleanup_temp": bool(payload.get("cleanup_temp", False)),
-        }
+def _qwen_run_url() -> str:
+    if QWEN_RUN_URL:
+        return QWEN_RUN_URL
+    if QWEN_ENDPOINT_ID:
+        return f"https://api.runpod.ai/v2/{QWEN_ENDPOINT_ID}/run"
+    raise RuntimeError("Missing QWEN_RUN_URL or QWEN_ENDPOINT_ID")
 
-    default_steps = {
+
+def build_qwen_payload_after_face(payload: Dict[str, Any]) -> Dict[str, Any]:
+    supplied_steps = payload.get("steps") or {}
+    full_mode = bool(payload.get("full_mode", False))
+
+    run_qwen = bool(
+        full_mode
+        or supplied_steps.get("enqueue_qwen", False)
+        or supplied_steps.get("qwen", False)
+        or payload.get("enqueue_qwen", False)
+        or payload.get("run_qwen", False)
+    )
+
+    run_embeddings = bool(
+        payload.get("run_embeddings", supplied_steps.get("embeddings", True if run_qwen else False))
+    )
+
+    if full_mode:
+        run_culling = bool(payload.get("culling_enabled", payload.get("run_culling", True)))
+    else:
+        run_culling = bool(
+            payload.get("culling_enabled", payload.get("run_culling", supplied_steps.get("culling", False)))
+        )
+
+    qwen_steps = payload.get("qwen_steps") or {
         "ingest": False,
         "compress": False,
         "face_index": False,
         "safe_people_reconcile": False,
         "rebuild_people": False,
-        "qwen": True,
-        "embeddings": True,
+        "qwen": run_qwen,
+        "embeddings": run_embeddings,
+        "culling": run_culling,
+        "cleanup_temp": bool(payload.get("cleanup_temp", supplied_steps.get("cleanup_temp", False))),
+    }
+
+    qwen_payload = {
+        **payload,
+        "album_slug": payload["album_slug"],
+        "album_name": payload.get("album_name"),
+        "events": payload["events"],
+        "full_mode": False,
+        "steps": qwen_steps,
+        "triggered_by": "photo-face-worker",
+    }
+
+    qwen_payload.pop("face_full_mode", None)
+    qwen_payload.pop("enqueue_qwen", None)
+    return qwen_payload
+
+
+def enqueue_qwen_after_face(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    if not RUNPOD_API_KEY:
+        raise RuntimeError("RUNPOD_API_KEY missing; cannot enqueue Qwen endpoint")
+
+    qwen_payload = build_qwen_payload_after_face(payload)
+
+    if not qwen_payload.get("steps", {}).get("qwen") and not qwen_payload.get("steps", {}).get("embeddings") and not qwen_payload.get("steps", {}).get("culling"):
+        return {
+            "enqueued": False,
+            "reason": "qwen/embeddings/culling steps are all false",
+            "qwen_payload": qwen_payload,
+        }
+
+    body = json.dumps({"input": qwen_payload}).encode("utf-8")
+    url = _qwen_run_url()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RUNPOD_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Qwen enqueue failed HTTP {e.code}: {raw}") from e
+
+    print("Qwen enqueued:", data, flush=True)
+    return {
+        "enqueued": True,
+        "run_url": url,
+        "qwen_job": data,
+        "qwen_payload": qwen_payload,
+    }
+
+
+def forward_culling_mode_to_qwen(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    if not RUNPOD_API_KEY:
+        raise RuntimeError("RUNPOD_API_KEY missing; cannot forward culling mode to Qwen endpoint")
+
+    body = json.dumps({"input": payload}).encode("utf-8")
+    url = _qwen_run_url()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RUNPOD_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Qwen forward failed HTTP {e.code}: {raw}") from e
+
+    return {"forwarded": True, "run_url": url, "qwen_job": data}
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    Face worker steps.
+
+    Correct order:
+    1. ingest
+    2. compress
+    3. face_index
+    4. safe_people_reconcile
+    5. crop_person_covers
+    6. enqueue_qwen / Gemma
+
+    Important:
+    - Qwen/Gemma must be enqueued after people are reconciled.
+      Otherwise the image-text worker sees no labeled people and returns rows=0.
+    - Person cover generation is separate from person creation.
+      It writes people.cover_face_s3_key.
+    """
+
+    full_mode = bool(payload.get("full_mode", False) or payload.get("face_full_mode", False))
+
+    default_steps = {
+        "ingest": True,
+        "compress": bool(full_mode),
+        "face_index": bool(full_mode),
+        "safe_people_reconcile": bool(full_mode),
+        "crop_person_covers": bool(full_mode),
+        "enqueue_qwen": bool(full_mode),
+
+        # Keep old/other pipeline steps present but off in face-worker.
+        "rebuild_people": False,
+        "qwen": False,
+        "embeddings": False,
         "culling": False,
         "cleanup_temp": False,
     }
 
     supplied = payload.get("steps")
-    if supplied:
+    if isinstance(supplied, dict):
         merged = {**default_steps, **supplied}
-        merged["ingest"] = False
-        merged["compress"] = False
-        merged["face_index"] = False
-        merged["safe_people_reconcile"] = False
-        merged["rebuild_people"] = False
-        if payload.get("culling_enabled") is not None or payload.get("run_culling") is not None:
-            merged["culling"] = bool(payload.get("culling_enabled", payload.get("run_culling")))
-        return merged
+    else:
+        merged = default_steps
 
-    return default_steps
+    # Never allow destructive people rebuild from this safe path.
+    merged["rebuild_people"] = False
+
+    return {k: bool(v) for k, v in merged.items()}
+
 
 def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if "album_slug" not in payload:
@@ -4110,7 +4693,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
 
     album_slug = payload["album_slug"]
     album_name = payload.get("album_name")
-    events = payload["events"]
+    events = normalize_event_source_prefixes(album_slug, payload["events"])
 
     steps = normalize_steps(payload)
 
@@ -4118,7 +4701,7 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
         raise RuntimeError(
             "Blocked: destructive rebuild_people is not allowed. "
             "This protects manually renamed people. "
-            "Use safe_people_reconcile=true in the Face worker instead."
+            "Use safe_people_reconcile=true instead."
         )
 
     update_job_status(job_id, "running", "restore_album", "Restoring album context")
@@ -4127,44 +4710,111 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     update_job_status(job_id, "running", "upsert_events", "Creating/restoring event rows")
     db_events = upsert_events(album_ctx, events)
 
+    # Use normalized event prefixes for Qwen/Gemma too, not the raw broad prefix from the request.
+    normalized_payload = {**payload, "events": db_events}
+
     results: Dict[str, Any] = {
         "album": album_ctx,
         "events": db_events,
         "steps": {},
     }
 
-    if steps.get("qwen", False):
-        update_job_status(job_id, "running", "qwen", "Running Qwen metadata")
-        results["steps"]["qwen"] = run_qwen_for_events(album_ctx, db_events)
+    # 1. Ingest originals from S3 into DB photo rows.
+    if steps.get("ingest", True):
+        update_job_status(
+            job_id,
+            "running",
+            "ingest",
+            "Scanning S3 originals and ingesting photos",
+        )
+        results["steps"]["ingest"] = scan_and_ingest_originals(album_ctx, db_events)
 
-    if steps.get("embeddings", False):
-        update_job_status(job_id, "running", "embeddings", "Generating text embeddings")
-        results["steps"]["embeddings"] = run_text_embeddings_for_events(album_ctx, db_events)
+        update_job_status(
+            job_id,
+            "running",
+            "s3_validation",
+            "Validating S3 source objects",
+        )
+        results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
 
-    if steps.get("culling", False):
-        culling_payload = {
-            **payload,
-            "album_slug": album_slug,
-            "album_type": payload.get("album_type") or album_ctx.get("album_type") or "general",
-            "persona_key": payload.get("persona_key") or payload.get("album_type") or album_ctx.get("album_type") or "general",
-            "limit": int(payload.get("best_photo_count") or payload.get("limit") or payload.get("requested_count") or 100),
-            "requested_count": int(payload.get("best_photo_count") or payload.get("limit") or payload.get("requested_count") or 100),
-            "score_limit": int(payload.get("score_limit") or payload.get("culling_score_limit") or 5000),
-            "embed_limit": int(payload.get("embed_limit") or payload.get("culling_embed_limit") or 5000),
-            "only_unscored": bool(payload.get("only_unscored", False)),
-            "only_missing": bool(payload.get("only_missing", False)),
-        }
-        update_job_status(job_id, "running", "best_photos_full", "Scoring, embedding, clustering, and selecting best photos")
-        results["steps"]["best_photos_full"] = best_photos_full(job_id, culling_payload)
+    # 2. Generate AI input images.
+    if steps.get("compress", False):
+        update_job_status(
+            job_id,
+            "running",
+            "compress",
+            "Generating AI input images",
+        )
+        results["steps"]["compress"] = compress_events(album_ctx, db_events)
+
+    # 3. Detect faces and write face embeddings.
+    if steps.get("face_index", False):
+        update_job_status(
+            job_id,
+            "running",
+            "face_index",
+            "Running InsightFace detection/recognition on GPU",
+        )
+        results["steps"]["face_index"] = face_index_events(album_ctx, db_events)
+
+    # 4. IMPORTANT: reconcile people before Qwen/Gemma enqueue.
+    # Do not crop covers inside this call; we run cover crop as its own explicit step below
+    # so existing albums can be backfilled without rerunning reconciliation.
+    if steps.get("safe_people_reconcile", False):
+        update_job_status(
+            job_id,
+            "running",
+            "safe_people_reconcile",
+            "Assigning faces to people before image-text metadata",
+        )
+        results["steps"]["safe_people_reconcile"] = safe_add_new_people_without_touching_existing_names(
+            album_ctx,
+            db_events,
+            build_candidates=False,
+            crop_covers=False,
+        )
+
+    # 5. Generate/backfill people cover images.
+    # This writes people.cover_face_s3_key.
+    if steps.get("crop_person_covers", False):
+        update_job_status(
+            job_id,
+            "running",
+            "crop_person_covers",
+            "Cropping and uploading missing person cover faces",
+        )
+        results["steps"]["crop_person_covers"] = crop_and_upload_missing_person_covers(album_ctx)
+
+    # Optional duplicate candidate generation, still off by default.
+    if bool(payload.get("build_duplicate_candidates", False)):
+        update_job_status(
+            job_id,
+            "running",
+            "build_duplicate_candidates",
+            "Building possible duplicate people candidates",
+        )
+        results["steps"]["build_duplicate_candidates"] = build_duplicate_candidates(album_ctx)
+
+    # 6. Only now enqueue Qwen/Gemma, after faces have person_id and covers can exist.
+    if steps.get("enqueue_qwen", False):
+        update_job_status(
+            job_id,
+            "running",
+            "enqueue_qwen",
+            "Enqueuing image-text endpoint after people reconcile",
+        )
+        results["steps"]["enqueue_qwen"] = enqueue_qwen_after_face(normalized_payload)
 
     if steps.get("cleanup_temp", False):
-        update_job_status(job_id, "running", "cleanup_temp", "Deleting temporary AI folders")
+        update_job_status(
+            job_id,
+            "running",
+            "cleanup_temp",
+            "Deleting temporary AI folders",
+        )
         results["steps"]["cleanup_temp"] = cleanup_temp_s3(album_ctx, db_events)
 
-    update_job_status(job_id, "running", "final_verify", "Verifying final counts")
-    results["final_verify"] = final_verify(album_ctx, db_events)
-
-    update_job_status(job_id, "completed", "done", "Qwen worker completed")
+    update_job_status(job_id, "completed", "face_worker", "Face worker completed")
     return results
 
 # ============================================================
@@ -4178,37 +4828,27 @@ def handler(event):
     payload = event.get("input", {})
 
     try:
-        print("Qwen Worker Start", flush=True)
+        print("Face Worker Start", flush=True)
         print("job_id:", job_id, flush=True)
         print("payload:", payload, flush=True)
 
-        if payload.get("debug_clear_qwen_cache"):
-            targets = [
-                "/runpod-volume/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct",
-                "/runpod-volume/huggingface/models--Qwen--Qwen2.5-VL-3B-Instruct",
-                "/models/huggingface/models--Qwen--Qwen2.5-VL-3B-Instruct",
-                "/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct"
-            ]
-            deleted = []
-            for t in targets:
-                if os.path.exists(t):
-                    shutil.rmtree(t, ignore_errors=True)
-                    deleted.append(t)
-            return {"ok": True, "deleted": deleted}
-
         if payload.get("debug_gpu"):
             import torch
+            import onnxruntime as ort
             return {
                 "ok": True,
                 "job_id": job_id,
                 "debug_gpu": {
-                    "strict_qwen_gpu": STRICT_QWEN_GPU,
+                    "strict_face_gpu": STRICT_FACE_GPU,
                     "torch": torch.__version__,
                     "torch_cuda": torch.version.cuda,
                     "torch_cuda_available": torch.cuda.is_available(),
                     "torch_device_count": torch.cuda.device_count(),
                     "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-                    "cudnn": torch.backends.cudnn.version(),
+                    "onnxruntime": ort.__version__,
+                    "onnxruntime_device": ort.get_device(),
+                    "onnxruntime_providers": ort.get_available_providers(),
+                    "insightface_allowed_modules": INSIGHTFACE_ALLOWED_MODULES,
                 },
             }
 
@@ -4243,10 +4883,8 @@ def handler(event):
             "select_best_photos",
             "best_photos_full",
         }
-
         if payload.get("mode") in culling_modes:
-            result = process_culling_mode(job_id, payload)
-            update_job_status(job_id, "completed", payload.get("mode"), "Culling mode completed")
+            result = forward_culling_mode_to_qwen(payload)
         else:
             result = process_album_events(job_id, payload)
 
@@ -4263,7 +4901,7 @@ def handler(event):
             "traceback": traceback.format_exc(),
         }
 
-        print("Qwen worker failed:", err, flush=True)
+        print("Face worker failed:", err, flush=True)
         update_job_status(job_id, "failed", "error", repr(e), err)
 
         return {
@@ -4274,12 +4912,6 @@ def handler(event):
         }
     finally:
         gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
