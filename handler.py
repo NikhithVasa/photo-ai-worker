@@ -152,6 +152,7 @@ _GEMMA_PROCESSOR = None
 _TEXT_EMBED_MODEL = None
 _IMAGE_EMBED_MODEL = None
 _IMAGE_EMBED_PROCESSOR = None
+_GEMMA_DTYPE_DEBUG_PRINTED = False
 
 
 # DB connection pooling/retry settings.
@@ -1904,6 +1905,10 @@ def load_gemma():
         model_kwargs["attn_implementation"] = GEMMA_ATTN_IMPLEMENTATION
 
     if GEMMA_QUANTIZATION == "4bit":
+        # Keep non-quantized modules such as norms / vision adapter in floating point.
+        # Without this, some Transformers+bitsandbytes builds can leave a Byte path
+        # that crashes LayerNorm: "LayerNormKernelImpl" not implemented for 'Byte'.
+        model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -1911,12 +1916,13 @@ def load_gemma():
             bnb_4bit_use_double_quant=True,
         )
     elif GEMMA_QUANTIZATION == "8bit":
+        model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
         )
     else:
         # Transformers 5 uses dtype; older builds may still expect torch_dtype.
-        model_kwargs["dtype"] = "auto"
+        model_kwargs["dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     try:
         model = GemmaModelClass.from_pretrained(
@@ -2489,27 +2495,22 @@ def _model_device_and_dtype(model: Any) -> Tuple[Any, Any]:
 
 def _move_inputs_to_model(inputs: Any, model: Any) -> Dict[str, Any]:
     """
-    Move a Gemma processor BatchFeature/dict to the model device without blindly
-    casting the whole object.
+    Move Gemma processor BatchFeature/dict to model device and force image-like
+    tensors to a floating activation dtype.
 
-    This fixes:
-      RuntimeError: "LayerNormKernelImpl" not implemented for 'Byte'
-
-    Cause:
-      processor.apply_chat_template can return image/pixel tensors as uint8/Byte.
-      Calling inputs.to(device) keeps those tensors as Byte, and Gemma eventually
-      sends them through LayerNorm, which requires floating point.
-
-    Rules:
-      - token ids / positions / masks stay integer or bool
-      - pixel/image/video tensors become model dtype, usually bf16/fp16/fp32
-      - existing floating tensors become model dtype
+    This is intentionally aggressive because Gemma 4 + bitsandbytes 4-bit can
+    expose uint8/Byte tensors either from the processor output or from model dtype
+    metadata. LayerNorm cannot run on Byte.
     """
     import torch
 
+    global _GEMMA_DTYPE_DEBUG_PRINTED
+
     device, model_dtype = _model_device_and_dtype(model)
 
-    integer_or_bool_keys = {
+    # These keys must stay integer/bool because they are token IDs, positions,
+    # masks, cache indices, or grid indices.
+    exact_integer_or_bool_keys = {
         "input_ids",
         "attention_mask",
         "token_type_ids",
@@ -2520,9 +2521,34 @@ def _move_inputs_to_model(inputs: Any, model: Any) -> Dict[str, Any]:
         "pixel_attention_mask",
     }
 
-    # Grid/index tensors must remain integer even though their names mention image/video.
-    integer_name_parts = ("mask", "grid", "ids", "position", "cache", "index")
-    float_name_parts = ("pixel", "image", "video", "vision")
+    integer_name_parts = (
+        "mask", "grid", "ids", "position", "cache", "index", "offset",
+    )
+    float_name_parts = (
+        "pixel", "image", "images", "video", "vision", "values", "embeds",
+    )
+
+    def should_keep_integer(key_l: str, value: Any) -> bool:
+        if key_l in exact_integer_or_bool_keys:
+            return True
+        if any(part in key_l for part in integer_name_parts):
+            return True
+        if torch.is_tensor(value) and value.dtype == torch.bool:
+            return True
+        return False
+
+    def should_force_float(key_l: str, value: Any) -> bool:
+        if not torch.is_tensor(value):
+            return False
+        if value.dtype.is_floating_point:
+            return True
+        if any(part in key_l for part in float_name_parts):
+            return True
+        # Image/video tensors are usually rank 4/5. If they are uint8, they must
+        # become floating point before entering Gemma vision layers.
+        if value.dtype == torch.uint8 and value.ndim >= 3:
+            return True
+        return False
 
     def move_one(key: str, value: Any) -> Any:
         if not torch.is_tensor(value):
@@ -2530,46 +2556,65 @@ def _move_inputs_to_model(inputs: Any, model: Any) -> Dict[str, Any]:
 
         key_l = key.lower()
 
-        if key in integer_or_bool_keys or any(part in key_l for part in integer_name_parts):
+        if should_keep_integer(key_l, value):
             return value.to(device=device)
 
-        if value.dtype.is_floating_point:
+        if should_force_float(key_l, value):
             return value.to(device=device, dtype=model_dtype)
 
-        # Important: image-like uint8/byte tensors must become floating point.
-        if any(part in key_l for part in float_name_parts):
-            return value.to(device=device, dtype=model_dtype)
-
-        # Unknown integer tensor: keep as integer on device.
+        # Unknown tensor. Keep integers as integers unless they look like image
+        # tensors above. This avoids corrupting token IDs.
         return value.to(device=device)
 
+    def walk(prefix: str, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: walk(f"{prefix}.{k}" if prefix else str(k), v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(walk(f"{prefix}.{i}", v) for i, v in enumerate(value))
+        return move_one(prefix, value)
+
     if isinstance(inputs, dict):
-        moved = {k: move_one(k, v) for k, v in inputs.items()}
+        moved = walk("", inputs)
     elif hasattr(inputs, "items"):
-        moved = {k: move_one(k, v) for k, v in inputs.items()}
+        moved = {k: walk(str(k), v) for k, v in inputs.items()}
     else:
-        # Last-resort fallback. Avoid dtype cast because this can corrupt token IDs.
         moved = inputs.to(device)
 
-    if GEMMA_DEBUG_INPUT_DTYPES and isinstance(moved, dict):
+    def tensor_report(obj: Any, prefix: str = "") -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if torch.is_tensor(obj):
+            out[prefix or "<root>"] = {
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+                "device": str(obj.device),
+            }
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                out.update(tensor_report(v, f"{prefix}.{k}" if prefix else str(k)))
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                out.update(tensor_report(v, f"{prefix}.{i}"))
+        return out
+
+    report = tensor_report(moved)
+    if GEMMA_DEBUG_INPUT_DTYPES or not _GEMMA_DTYPE_DEBUG_PRINTED:
+        _GEMMA_DTYPE_DEBUG_PRINTED = True
         print(
-            "Gemma input tensor dtypes: " + json.dumps(
-                {
-                    k: {
-                        "shape": list(v.shape),
-                        "dtype": str(v.dtype),
-                        "device": str(v.device),
-                    }
-                    for k, v in moved.items()
-                    if torch.is_tensor(v)
-                },
-                default=str,
-            ),
+            "Gemma input tensor dtypes: " + json.dumps(report, default=str),
             flush=True,
         )
 
-    return moved
+    # Hard guard: fail before generate with a useful key if any non-index Byte
+    # tensor remains. This is better than the opaque LayerNorm Byte error.
+    bad = {
+        k: v for k, v in report.items()
+        if v.get("dtype") == "torch.uint8"
+        and not any(part in k.lower() for part in integer_name_parts)
+    }
+    if bad:
+        raise RuntimeError(f"Gemma input still contains non-index uint8 tensors after move: {bad}")
 
+    return moved
 
 def _gemma_messages_for_image(image_path: Path) -> List[Dict[str, Any]]:
     return [
@@ -2643,12 +2688,17 @@ def _gemma_describe_batch_once(image_paths: List[Path]) -> List[Dict[str, Any]]:
     # Trim by the padded input width, not per-row attention length.
     input_len = int(inputs["input_ids"].shape[-1])
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=GEMMA_MAX_NEW_TOKENS,
-            do_sample=False,
-        )
+    try:
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=GEMMA_MAX_NEW_TOKENS,
+                do_sample=False,
+            )
+    except Exception as e:
+        print("Gemma generate failed with traceback:", repr(e), flush=True)
+        print(traceback.format_exc(), flush=True)
+        raise
 
     generated = [out[input_len:] for out in outputs]
     texts = processor.batch_decode(
