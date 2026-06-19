@@ -64,41 +64,46 @@ DUPLICATE_CANDIDATE_SIM_THRESHOLD = float(os.environ.get("DUPLICATE_CANDIDATE_SI
 # IMAGE-TO-TEXT PROVIDER
 # ============================================================
 
-# Default is Gemma.
-# Qwen runs ONLY if you explicitly set one of these environment variables to qwen:
-#   IMAGE_TEXT_MODEL_PROVIDER=qwen
-#   VISION_MODEL_PROVIDER=qwen
-# If neither env var is set, or if either is set to gemma, this worker runs Gemma.
-IMAGE_TEXT_MODEL_PROVIDER = (
-    os.environ.get("IMAGE_TEXT_MODEL_PROVIDER")
-    or os.environ.get("VISION_MODEL_PROVIDER")
-    or "gemma"
-).strip().lower()
+# Gemma-only image-text worker.
+# DB/status/function names still say qwen_* in a few places for backward compatibility
+# with your existing schema, but runtime inference is intentionally Gemma only.
+#
+# Why remove the runtime toggle?
+# - One codepath is easier to stabilize and benchmark.
+# - The previous Qwen/Gemma toggle made batching/dtype handling harder to reason about.
+# - Your current blocker is Gemma; this worker should make Gemma fast and reliable first.
+IMAGE_TEXT_MODEL_PROVIDER = "gemma"
 
-if IMAGE_TEXT_MODEL_PROVIDER not in {"gemma", "qwen"}:
-    raise RuntimeError(
-        "IMAGE_TEXT_MODEL_PROVIDER must be one of: gemma, qwen. "
-        f"Got: {IMAGE_TEXT_MODEL_PROVIDER!r}"
-    )
-
-# Qwen settings.
-# These are used ONLY when IMAGE_TEXT_MODEL_PROVIDER == "qwen".
-# DB/status/function names may still say qwen_* for backward compatibility.
+# Historical Qwen vars kept only so old env/templates do not crash if they still exist.
+# They are not used unless you reintroduce Qwen code intentionally later.
 QWEN_MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 QWEN_IMAGE_MAX_SIDE = int(os.environ.get("QWEN_IMAGE_MAX_SIDE", "448"))
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "320"))
 QWEN_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_INFERENCE_BATCH_SIZE", "4"))
 
 # Gemma settings.
-# These are used by default.
-# For 24GB GPUs, keep GEMMA_QUANTIZATION=4bit first.
+# For A5000 24GB, start with GEMMA_INFERENCE_BATCH_SIZE=2 or 4.
+# The code can split batches on CUDA OOM, so you can push this upward safely.
 GEMMA_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
 GEMMA_IMAGE_MAX_SIDE = int(os.environ.get("GEMMA_IMAGE_MAX_SIDE", "448"))
 GEMMA_MAX_NEW_TOKENS = int(os.environ.get("GEMMA_MAX_NEW_TOKENS", "320"))
-GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "1"))
+GEMMA_INFERENCE_BATCH_SIZE = int(os.environ.get("GEMMA_INFERENCE_BATCH_SIZE", "4"))
 GEMMA_QUANTIZATION = os.environ.get("GEMMA_QUANTIZATION", "4bit").strip().lower()
 GEMMA_ENABLE_THINKING = os.environ.get("GEMMA_ENABLE_THINKING", "false").lower() == "true"
 GEMMA_ATTN_IMPLEMENTATION = os.environ.get("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
+
+# Keep false for speed. When true, prints tensor dtypes once per batch.
+GEMMA_DEBUG_INPUT_DTYPES = os.environ.get("GEMMA_DEBUG_INPUT_DTYPES", "false").lower() == "true"
+
+# If a large Gemma batch OOMs, split it into smaller batches automatically.
+GEMMA_SPLIT_BATCH_ON_OOM = os.environ.get("GEMMA_SPLIT_BATCH_ON_OOM", "true").lower() == "true"
+
+# For speed, do not retry a failed batch one image at a time unless explicitly enabled.
+# This prevents the repeated failure loop you saw in logs.
+IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE = os.environ.get(
+    "IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE",
+    "false",
+).lower() == "true"
 
 if GEMMA_QUANTIZATION not in {"none", "4bit", "8bit"}:
     raise RuntimeError("GEMMA_QUANTIZATION must be one of: none, 4bit, 8bit")
@@ -1942,9 +1947,8 @@ def load_gemma():
 
 
 def image_text_inference_batch_size() -> int:
-    if IMAGE_TEXT_MODEL_PROVIDER == "gemma":
-        return max(1, GEMMA_INFERENCE_BATCH_SIZE)
-    return max(1, QWEN_INFERENCE_BATCH_SIZE)
+    # Gemma-only runtime. qwen_* DB/status names remain for compatibility.
+    return max(1, GEMMA_INFERENCE_BATCH_SIZE)
 
 
 def qwen_prompt() -> str:
@@ -2456,65 +2460,164 @@ def _gemma_response_to_text(processor: Any, response: Any) -> str:
     return str(parsed or "")
 
 
-def _move_inputs_to_model(inputs: Any, model: Any) -> Any:
-    device = getattr(model, "device", None)
-
-    if device is None:
-        try:
-            device = next(model.parameters()).device
-        except Exception:
-            device = "cuda"
-
-    model_dtype = getattr(model, "dtype", None)
-
-    try:
-        if model_dtype is not None:
-            return inputs.to(device, dtype=model_dtype)
-    except TypeError:
-        pass
-    except Exception:
-        pass
-
-    return inputs.to(device)
-
-
-def _gemma_describe_one(image_path: Path) -> Dict[str, Any]:
+def _model_device_and_dtype(model: Any) -> Tuple[Any, Any]:
     import torch
 
-    model, processor = load_gemma()
+    try:
+        device = next(model.parameters()).device
+    except Exception:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    messages = [
+    model_dtype = getattr(model, "dtype", None)
+    if model_dtype is None:
+        # Gemma on CUDA is fastest/stablest with bf16 activations when supported.
+        model_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    return device, model_dtype
+
+
+def _move_inputs_to_model(inputs: Any, model: Any) -> Dict[str, Any]:
+    """
+    Move a Gemma processor BatchFeature/dict to the model device without blindly
+    casting the whole object.
+
+    This fixes:
+      RuntimeError: "LayerNormKernelImpl" not implemented for 'Byte'
+
+    Cause:
+      processor.apply_chat_template can return image/pixel tensors as uint8/Byte.
+      Calling inputs.to(device) keeps those tensors as Byte, and Gemma eventually
+      sends them through LayerNorm, which requires floating point.
+
+    Rules:
+      - token ids / positions / masks stay integer or bool
+      - pixel/image/video tensors become model dtype, usually bf16/fp16/fp32
+      - existing floating tensors become model dtype
+    """
+    import torch
+
+    device, model_dtype = _model_device_and_dtype(model)
+
+    integer_or_bool_keys = {
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "position_ids",
+        "cache_position",
+        "image_token_mask",
+        "cross_attention_mask",
+        "pixel_attention_mask",
+    }
+
+    # Grid/index tensors must remain integer even though their names mention image/video.
+    integer_name_parts = ("mask", "grid", "ids", "position", "cache", "index")
+    float_name_parts = ("pixel", "image", "video", "vision")
+
+    def move_one(key: str, value: Any) -> Any:
+        if not torch.is_tensor(value):
+            return value.to(device) if hasattr(value, "to") else value
+
+        key_l = key.lower()
+
+        if key in integer_or_bool_keys or any(part in key_l for part in integer_name_parts):
+            return value.to(device=device)
+
+        if value.dtype.is_floating_point:
+            return value.to(device=device, dtype=model_dtype)
+
+        # Important: image-like uint8/byte tensors must become floating point.
+        if any(part in key_l for part in float_name_parts):
+            return value.to(device=device, dtype=model_dtype)
+
+        # Unknown integer tensor: keep as integer on device.
+        return value.to(device=device)
+
+    if isinstance(inputs, dict):
+        moved = {k: move_one(k, v) for k, v in inputs.items()}
+    elif hasattr(inputs, "items"):
+        moved = {k: move_one(k, v) for k, v in inputs.items()}
+    else:
+        # Last-resort fallback. Avoid dtype cast because this can corrupt token IDs.
+        moved = inputs.to(device)
+
+    if GEMMA_DEBUG_INPUT_DTYPES and isinstance(moved, dict):
+        print(
+            "Gemma input tensor dtypes: " + json.dumps(
+                {
+                    k: {
+                        "shape": list(v.shape),
+                        "dtype": str(v.dtype),
+                        "device": str(v.device),
+                    }
+                    for k, v in moved.items()
+                    if torch.is_tensor(v)
+                },
+                default=str,
+            ),
+            flush=True,
+        )
+
+    return moved
+
+
+def _gemma_messages_for_image(image_path: Path) -> List[Dict[str, Any]]:
+    return [
         {
             "role": "user",
             "content": [
-                # Gemma HF examples use url for image paths.
+                # Gemma HF examples use url for image paths. Local paths work here.
                 {"type": "image", "url": str(image_path)},
                 {"type": "text", "text": qwen_prompt()},
             ],
         }
     ]
 
+
+def _gemma_apply_chat_template(processor: Any, conversations: List[List[Dict[str, Any]]]) -> Any:
     template_kwargs: Dict[str, Any] = {
         "tokenize": True,
         "return_dict": True,
         "return_tensors": "pt",
         "add_generation_prompt": True,
+        "padding": True,
     }
 
     try:
-        inputs = processor.apply_chat_template(
-            messages,
+        return processor.apply_chat_template(
+            conversations,
             enable_thinking=GEMMA_ENABLE_THINKING,
             **template_kwargs,
         )
     except TypeError:
-        inputs = processor.apply_chat_template(
-            messages,
+        # Some Transformers versions do not accept enable_thinking.
+        return processor.apply_chat_template(
+            conversations,
             **template_kwargs,
         )
 
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = repr(exc).lower()
+    return (
+        "cuda out of memory" in text
+        or "outofmemoryerror" in text
+        or "cublas_status_alloc_failed" in text
+        or "cuda error: out of memory" in text
+    )
+
+
+def _gemma_describe_batch_once(image_paths: List[Path]) -> List[Dict[str, Any]]:
+    import torch
+
+    model, processor = load_gemma()
+
+    conversations = [_gemma_messages_for_image(path) for path in image_paths]
+    inputs = _gemma_apply_chat_template(processor, conversations)
     inputs = _move_inputs_to_model(inputs, model)
-    input_len = inputs["input_ids"].shape[-1]
+
+    # With padding=True, generate returns the padded prompt plus generated tokens.
+    # Trim by the padded input width, not per-row attention length.
+    input_len = int(inputs["input_ids"].shape[-1])
 
     with torch.no_grad():
         outputs = model.generate(
@@ -2523,51 +2626,81 @@ def _gemma_describe_one(image_path: Path) -> Dict[str, Any]:
             do_sample=False,
         )
 
-    response = processor.decode(
-        outputs[0][input_len:],
+    generated = [out[input_len:] for out in outputs]
+    texts = processor.batch_decode(
+        generated,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
 
-    text = _gemma_response_to_text(processor, response)
+    results = []
+    for text in texts:
+        parsed_text = _gemma_response_to_text(processor, text)
+        results.append(normalize_qwen_data(extract_json(parsed_text)))
 
-    del inputs, outputs
+    del inputs, outputs, generated
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return normalize_qwen_data(extract_json(text))
+    return results
 
 
 def _gemma_describe_batch_impl(image_paths: List[Path]) -> List[Dict[str, Any]]:
-    # Gemma 4 12B is much heavier than Qwen2.5-VL-3B, so keep this sequential
-    # unless you validate batch inference on your exact GPU.
-    results = []
-    for path in image_paths:
-        results.append(_gemma_describe_one(path))
-    return results
+    """
+    True Gemma batch inference.
+
+    Uses the full batch to maximize GPU utilization. If the batch is too large
+    for the GPU and GEMMA_SPLIT_BATCH_ON_OOM=true, it recursively splits the
+    batch so the job keeps progressing instead of failing the entire run.
+    """
+    if not image_paths:
+        return []
+
+    started = time.time()
+    print(
+        f"Gemma batch start: images={len(image_paths)}, "
+        f"max_new_tokens={GEMMA_MAX_NEW_TOKENS}, "
+        f"image_max_side={GEMMA_IMAGE_MAX_SIDE}",
+        flush=True,
+    )
+
+    try:
+        result = _gemma_describe_batch_once(image_paths)
+        print(
+            f"Gemma batch done: images={len(image_paths)}, seconds={round(time.time() - started, 2)}",
+            flush=True,
+        )
+        return result
+    except RuntimeError as e:
+        if GEMMA_SPLIT_BATCH_ON_OOM and _is_cuda_oom(e) and len(image_paths) > 1:
+            import torch
+
+            print(
+                f"Gemma batch OOM; splitting batch: images={len(image_paths)}, error={repr(e)}",
+                flush=True,
+            )
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            mid = len(image_paths) // 2
+            return _gemma_describe_batch_impl(image_paths[:mid]) + _gemma_describe_batch_impl(image_paths[mid:])
+
+        raise
 
 
 def qwen_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
     """
     Backward-compatible function name.
 
-    DB/status fields still say qwen_*, but the actual model is controlled by
-    IMAGE_TEXT_MODEL_PROVIDER.
-
-    Default behavior:
-      - Gemma runs when no provider env var is set.
-      - Gemma runs when IMAGE_TEXT_MODEL_PROVIDER=gemma or VISION_MODEL_PROVIDER=gemma.
-      - Qwen runs ONLY when IMAGE_TEXT_MODEL_PROVIDER=qwen or VISION_MODEL_PROVIDER=qwen.
+    Runtime is Gemma-only now. DB/status fields still say qwen_* so the rest
+    of your existing schema and UI do not need to change.
     """
     print(
-        f"Image-to-text provider={IMAGE_TEXT_MODEL_PROVIDER}, images={len(image_paths)}",
+        f"Image-to-text provider=gemma, images={len(image_paths)}, batch_size={GEMMA_INFERENCE_BATCH_SIZE}",
         flush=True,
     )
-
-    if IMAGE_TEXT_MODEL_PROVIDER == "qwen":
-        return _qwen_describe_batch_impl(image_paths)
-
     return _gemma_describe_batch_impl(image_paths)
 
 def get_label_to_id(album_ctx: Dict[str, Any]) -> Dict[str, str]:
@@ -2767,17 +2900,25 @@ def run_qwen_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]])
                     errors.append({"file_name": photo.get("file_name"), "error": repr(e)})
 
         except Exception as batch_err:
-            print("QWEN BATCH FAILED, retrying individually:", repr(batch_err), flush=True)
+            print("GEMMA BATCH FAILED:", repr(batch_err), flush=True)
 
-            for photo, qwen_img in prepared:
-                try:
-                    data = qwen_describe_batch([qwen_img])[0]
-                    save_qwen_photo(photo, data, label_to_id, event_by_id=event_by_id)
-                    ok += 1
-                except Exception as e:
+            if IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE and len(prepared) > 1:
+                print("Retrying Gemma batch individually because IMAGE_TEXT_RETRY_INDIVIDUAL_ON_BATCH_FAILURE=true", flush=True)
+                for photo, qwen_img in prepared:
+                    try:
+                        data = qwen_describe_batch([qwen_img])[0]
+                        save_qwen_photo(photo, data, label_to_id, event_by_id=event_by_id)
+                        ok += 1
+                    except Exception as e:
+                        fail += 1
+                        mark_qwen_failed(photo, e)
+                        errors.append({"file_name": photo.get("file_name"), "error": repr(e)})
+            else:
+                # Avoid the repeated failure loop from the old code. Mark this batch failed once.
+                for photo, _qwen_img in prepared:
                     fail += 1
-                    mark_qwen_failed(photo, e)
-                    errors.append({"file_name": photo.get("file_name"), "error": repr(e)})
+                    mark_qwen_failed(photo, batch_err)
+                    errors.append({"file_name": photo.get("file_name"), "error": repr(batch_err)})
 
     result = {"rows": len(rows), "ok": ok, "failed": fail, "errors": errors[:25]}
     print("Qwen result:", result, flush=True)
