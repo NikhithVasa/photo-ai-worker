@@ -31,9 +31,11 @@ RUN python -m pip install -r /app/requirements.txt
 
 RUN python - <<'PY'
 import torch
+import torchvision
 import transformers
 print('torch:', torch.__version__)
 print('torch cuda:', torch.version.cuda)
+print('torchvision:', torchvision.__version__)
 print('transformers:', transformers.__version__)
 try:
     from transformers import Qwen2_5_VLForConditionalGeneration

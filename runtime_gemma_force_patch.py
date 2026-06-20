@@ -9,11 +9,16 @@ Adds without replacing the large legacy handler.py:
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import gc
+import os
+from pathlib import Path
+from typing import Any, Dict, List
 
 import handler as h
 
 _ORIGINAL_PROCESS_ALBUM_EVENTS = h.process_album_events
+_GEMMA_MODEL = None
+_GEMMA_PROCESSOR = None
 _FORCE_FLAG_NAMES = (
     "force_gemma",
     "overwrite_gemma",
@@ -32,6 +37,199 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on", "force", "overwrite"}
     return bool(value)
+
+
+def _image_text_model_provider() -> str:
+    provider = (
+        getattr(h, "IMAGE_TEXT_MODEL_PROVIDER", None)
+        or os.getenv("IMAGE_TEXT_MODEL_PROVIDER")
+        or os.getenv("VISION_MODEL_PROVIDER")
+        or "gemma"
+    )
+    provider = str(provider).strip().lower()
+
+    if provider not in {"qwen", "gemma"}:
+        raise RuntimeError(
+            f"IMAGE_TEXT_MODEL_PROVIDER must be qwen or gemma; got {provider!r}"
+        )
+
+    h.IMAGE_TEXT_MODEL_PROVIDER = provider
+    return provider
+
+
+def _gemma_quantization() -> str:
+    quantization = (os.getenv("GEMMA_QUANTIZATION") or "4bit").strip().lower()
+
+    if quantization == "none" and not _truthy(
+        os.getenv("ALLOW_GEMMA_FULL_PRECISION", "false")
+    ):
+        print(
+            "GEMMA_QUANTIZATION=none requested; using 4bit unless "
+            "ALLOW_GEMMA_FULL_PRECISION=true",
+            flush=True,
+        )
+        quantization = "4bit"
+
+    if quantization not in {"none", "4bit", "8bit"}:
+        raise RuntimeError("GEMMA_QUANTIZATION must be one of: none, 4bit, 8bit")
+
+    return quantization
+
+
+def _load_gemma():
+    global _GEMMA_MODEL, _GEMMA_PROCESSOR
+
+    if _GEMMA_MODEL is not None and _GEMMA_PROCESSOR is not None:
+        return _GEMMA_MODEL, _GEMMA_PROCESSOR
+
+    import torch
+    from transformers import AutoProcessor, BitsAndBytesConfig
+
+    try:
+        from transformers import AutoModelForMultimodalLM as GemmaModelClass
+    except Exception:
+        from transformers import AutoModelForImageTextToText as GemmaModelClass
+
+    if hasattr(h, "assert_torch_gpu_ready"):
+        h.assert_torch_gpu_ready("Gemma")
+
+    model_id = os.getenv("GEMMA_MODEL_ID", "google/gemma-4-12B-it")
+    quantization = _gemma_quantization()
+    attn_impl = os.getenv("GEMMA_ATTN_IMPLEMENTATION", "sdpa")
+    token = os.getenv("HF_TOKEN") or None
+
+    print(
+        f"Loading Gemma model: {model_id}, "
+        f"quantization={quantization}, attn={attn_impl}",
+        flush=True,
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        token=token,
+        trust_remote_code=True,
+    )
+
+    model_kwargs = {
+        "device_map": "auto",
+        "trust_remote_code": True,
+    }
+
+    if token:
+        model_kwargs["token"] = token
+
+    if attn_impl:
+        model_kwargs["attn_implementation"] = attn_impl
+
+    if quantization == "4bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    elif quantization == "8bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    else:
+        model_kwargs["dtype"] = "auto"
+
+    try:
+        model = GemmaModelClass.from_pretrained(model_id, **model_kwargs)
+    except TypeError:
+        if "dtype" in model_kwargs:
+            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
+        model = GemmaModelClass.from_pretrained(model_id, **model_kwargs)
+
+    model.eval()
+
+    _GEMMA_MODEL = model
+    _GEMMA_PROCESSOR = processor
+
+    print("Gemma loaded", flush=True)
+    return _GEMMA_MODEL, _GEMMA_PROCESSOR
+
+
+def _move_inputs_to_model(inputs: Any, model: Any) -> Any:
+    try:
+        device = next(model.parameters()).device
+    except Exception:
+        device = getattr(model, "device", "cuda")
+
+    try:
+        return inputs.to(device)
+    except Exception:
+        return {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in dict(inputs).items()
+        }
+
+
+def _gemma_describe_one(image_path: Path) -> Dict[str, Any]:
+    import torch
+
+    model, processor = _load_gemma()
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "url": str(image_path)},
+                {"type": "text", "text": h.qwen_prompt()},
+            ],
+        }
+    ]
+
+    template_kwargs = {
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+        "add_generation_prompt": True,
+    }
+
+    try:
+        inputs = processor.apply_chat_template(
+            messages,
+            enable_thinking=_truthy(
+                os.getenv("GEMMA_ENABLE_THINKING", "false")
+            ),
+            **template_kwargs,
+        )
+    except TypeError:
+        inputs = processor.apply_chat_template(messages, **template_kwargs)
+
+    inputs = _move_inputs_to_model(inputs, model)
+    input_len = inputs["input_ids"].shape[-1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=int(os.getenv("GEMMA_MAX_NEW_TOKENS", "320")),
+            do_sample=False,
+        )
+
+    response = processor.decode(
+        outputs[0][input_len:],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+    del inputs, outputs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return h.normalize_qwen_data(h.extract_json(response))
+
+
+def _gemma_describe_batch(image_paths: List[Path]) -> List[Dict[str, Any]]:
+    print(
+        "Image-to-text provider=gemma, "
+        f"model={os.getenv('GEMMA_MODEL_ID', 'google/gemma-4-12B-it')}, "
+        f"images={len(image_paths)}",
+        flush=True,
+    )
+
+    return [_gemma_describe_one(Path(path)) for path in image_paths]
 
 
 def _force_image_text_requested(payload: Dict[str, Any], steps: Dict[str, Any]) -> bool:
@@ -144,11 +342,12 @@ def process_album_events_with_local_image_text(job_id: str, payload: Dict[str, A
     should_run_embeddings = bool(steps.get("embeddings") or payload.get("run_embeddings"))
 
     if should_run_image_text:
+        provider = _image_text_model_provider()
         h.update_job_status(
             job_id,
             "running",
             "qwen",
-            f"Running {h.IMAGE_TEXT_MODEL_PROVIDER} image-text metadata"
+            f"Running {provider} image-text metadata"
             + (" with overwrite" if force_image_text else ""),
         )
 
@@ -158,7 +357,7 @@ def process_album_events_with_local_image_text(job_id: str, payload: Dict[str, A
                 h.RESET_EXISTING_QWEN = True
             qwen_result = h.run_qwen_for_events(album_ctx, db_events)
             qwen_result["force_reset"] = force_image_text
-            qwen_result["image_text_provider"] = h.IMAGE_TEXT_MODEL_PROVIDER
+            qwen_result["image_text_provider"] = provider
             result.setdefault("steps", {})["qwen"] = qwen_result
         finally:
             h.RESET_EXISTING_QWEN = old_reset
@@ -174,9 +373,31 @@ def process_album_events_with_local_image_text(job_id: str, payload: Dict[str, A
 
 
 def apply_patch() -> None:
+    provider = _image_text_model_provider()
+
+    if provider == "gemma":
+        h.qwen_describe_batch = _gemma_describe_batch
+        h.QWEN_INFERENCE_BATCH_SIZE = max(
+            1,
+            int(os.getenv("GEMMA_INFERENCE_BATCH_SIZE", "1")),
+        )
+        print(
+            "Gemma provider routing installed: "
+            "handler.qwen_describe_batch -> Gemma",
+            flush=True,
+        )
+    else:
+        print(
+            "Qwen provider selected; keeping handler.qwen_describe_batch",
+            flush=True,
+        )
+
     h.qwen_prompt = rich_image_text_prompt
     h.process_album_events = process_album_events_with_local_image_text
-    print("Runtime Gemma/Qwen force patch installed", flush=True)
+    print(
+        f"Runtime Gemma/Qwen force patch installed provider={provider}",
+        flush=True,
+    )
 
 
 apply_patch()
