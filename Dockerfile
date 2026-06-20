@@ -32,18 +32,14 @@ RUN python -m pip install -r /app/requirements.txt
 RUN python - <<'PY'
 import torch
 import transformers
-from transformers import AutoProcessor
-
 print('torch:', torch.__version__)
 print('torch cuda:', torch.version.cuda)
 print('transformers:', transformers.__version__)
-
 try:
     from transformers import Qwen2_5_VLForConditionalGeneration
     print('Qwen2_5_VLForConditionalGeneration import OK')
 except Exception as e:
     raise SystemExit(f'Qwen import failed: {e}')
-
 try:
     from transformers import AutoModelForMultimodalLM
     print('AutoModelForMultimodalLM import OK')
@@ -76,7 +72,6 @@ print('device count at build:', torch.cuda.device_count())
 print('cudnn:', torch.backends.cudnn.version())
 PY
 
-# Download Qwen model weights into image cache without loading model into GPU/RAM.
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download('Qwen/Qwen2.5-VL-3B-Instruct')
@@ -89,35 +84,8 @@ SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 print('Downloaded sentence-transformers/all-MiniLM-L6-v2')
 PY
 
-# Optional Gemma preload.
-# Build with:
-# docker build --build-arg PRELOAD_GEMMA=true --build-arg HF_TOKEN=xxx .
-#
-# But I recommend keeping PRELOAD_GEMMA=false first because Gemma 12B will make the image huge.
-ARG PRELOAD_GEMMA=false
-ARG HF_TOKEN=""
-
-RUN <<'SH'
-set -e
-
-if [ "$PRELOAD_GEMMA" = "true" ]; then
-  export HF_TOKEN="${HF_TOKEN}"
-
-  python - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-
-token = os.environ.get("HF_TOKEN") or None
-snapshot_download("google/gemma-4-12B-it", token=token)
-
-print("Downloaded google/gemma-4-12B-it")
-PY
-
-else
-  echo "Skipping Gemma preload because PRELOAD_GEMMA is not true"
-fi
-SH
-
 COPY handler.py /app/handler.py
+COPY runtime_gemma_force_patch.py /app/runtime_gemma_force_patch.py
+COPY entrypoint.py /app/entrypoint.py
 
-CMD ["python", "-u", "/app/handler.py"]
+CMD ["python", "-u", "/app/entrypoint.py"]
