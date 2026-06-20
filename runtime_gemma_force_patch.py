@@ -1,11 +1,4 @@
-"""Runtime patch for image-text metadata reruns.
 
-Adds without replacing the large legacy handler.py:
-- per-request force/overwrite flags for Gemma/Qwen metadata
-- local steps.qwen execution on the image-text worker path
-- optional immediate text-embedding refresh after rerunning metadata
-- a richer search-oriented prompt for text-to-text retrieval
-"""
 
 from __future__ import annotations
 
@@ -60,16 +53,6 @@ def _image_text_model_provider() -> str:
 def _gemma_quantization() -> str:
     quantization = (os.getenv("GEMMA_QUANTIZATION") or "4bit").strip().lower()
 
-    if quantization == "none" and not _truthy(
-        os.getenv("ALLOW_GEMMA_FULL_PRECISION", "false")
-    ):
-        print(
-            "GEMMA_QUANTIZATION=none requested; using 4bit unless "
-            "ALLOW_GEMMA_FULL_PRECISION=true",
-            flush=True,
-        )
-        quantization = "4bit"
-
     if quantization not in {"none", "4bit", "8bit"}:
         raise RuntimeError("GEMMA_QUANTIZATION must be one of: none, 4bit, 8bit")
 
@@ -112,6 +95,7 @@ def _load_gemma():
 
     model_kwargs = {
         "device_map": "auto",
+        "dtype": "auto",
         "trust_remote_code": True,
     }
 
@@ -121,17 +105,27 @@ def _load_gemma():
     if attn_impl:
         model_kwargs["attn_implementation"] = attn_impl
 
+    # Gemma 4 Unified casts raw image/audio inputs to these projection weights'
+    # dtypes. Quantizing them stores the weights as uint8 and breaks normalization.
+    bnb_skip_modules = [
+        "lm_head",
+        "model.embed_vision",
+        "model.embed_audio",
+    ]
+
     if quantization == "4bit":
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
+            llm_int8_skip_modules=bnb_skip_modules,
         )
     elif quantization == "8bit":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-    else:
-        model_kwargs["dtype"] = "auto"
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_skip_modules=bnb_skip_modules,
+        )
 
     try:
         model = GemmaModelClass.from_pretrained(model_id, **model_kwargs)

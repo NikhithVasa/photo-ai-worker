@@ -88,7 +88,6 @@ PY
 
 COPY handler.py /app/handler.py
 COPY runtime_gemma_force_patch.py /app/runtime_gemma_force_patch.py
-COPY runtime_gemma_dtype_patch.py /app/runtime_gemma_dtype_patch.py
 COPY entrypoint.py /app/entrypoint.py
 
 CMD ["python", "-u", "/app/entrypoint.py"]
