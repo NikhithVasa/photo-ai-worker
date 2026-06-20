@@ -1,0 +1,1 @@
+Use the overwrite flag to rebuild existing image text metadata and text embeddings.
