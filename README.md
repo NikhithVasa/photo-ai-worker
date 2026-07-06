@@ -1,4 +1,13 @@
-# Two Worker Handlers — Responsibilities
+# Photo AI Worker
+
+This repository contains the image-text side of the SaathiDesk media pipeline. It is normally invoked after the face worker has ingested images, generated previews, detected faces, reconciled people, and enqueued the image-text job.
+
+## More Docs
+
+- [Developer Guide](docs/developer-guide.md)
+- [Agent Notes](docs/agent-notes.md)
+
+## Two Worker Handlers - Responsibilities
 
 ## 1. Face Worker `handler.py`
 
