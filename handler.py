@@ -52,6 +52,13 @@ RESET_EXISTING_QWEN = os.environ.get("RESET_EXISTING_QWEN", "false").lower() == 
 AI_INPUT_MAX_SIDE = int(os.environ.get("AI_INPUT_MAX_SIDE", "1600"))
 AI_INPUT_WEBP_QUALITY = int(os.environ.get("AI_INPUT_WEBP_QUALITY", "88"))
 
+# Web preview settings.
+# Browsers cannot render RAW (.nef/.cr2/.arw/.dng) or TIFF/HEIC in <img>.
+# We generate a lightweight browser-renderable JPEG so these photos are
+# visible in the gallery right after ingest, before full compression runs.
+PREVIEW_MAX_SIDE = int(os.environ.get("PREVIEW_MAX_SIDE", "2048"))
+PREVIEW_JPEG_QUALITY = int(os.environ.get("PREVIEW_JPEG_QUALITY", "85"))
+
 # Compression parallelism.
 # Compression is S3/network + CPU image encode. GPU is not used here.
 # Keep this conservative if your RDS is small; each worker only touches DB at the end.
@@ -122,6 +129,12 @@ IMAGE_EXTS = {
 
 RAW_IMAGE_EXTS = {".nef", ".cr2", ".arw", ".dng"}
 HEIF_IMAGE_EXTS = {".heic", ".heif"}
+
+# Formats a browser can decode directly in an <img>. Anything not in this set
+# (RAW, TIFF, HEIC, ...) needs a generated JPEG preview to be viewable.
+WEB_RENDERABLE_EXTS = {
+    ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".gif", ".avif"
+}
 
 UUID_PREFIX_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_.+",
@@ -654,6 +667,45 @@ def save_ai_input_webp(source_local: Path, output_local: Path) -> Tuple[int, int
     img.thumbnail((AI_INPUT_MAX_SIDE, AI_INPUT_MAX_SIDE), Image.Resampling.LANCZOS)
     output_local.parent.mkdir(parents=True, exist_ok=True)
     img.save(output_local, "WEBP", quality=AI_INPUT_WEBP_QUALITY, method=6)
+    return img.size
+
+
+def save_web_preview(source_local: Path, output_local: Path) -> Tuple[int, int]:
+    """
+    Produce a browser-renderable JPEG preview from any source format.
+
+    For RAW files we first try the embedded JPEG preview via rawpy.extract_thumb,
+    which is fast and avoids a full demosaic. Anything else (or RAW with no usable
+    embedded thumb) falls back to a full decode via read_image_any.
+    """
+    ext = source_local.suffix.lower()
+    output_local.parent.mkdir(parents=True, exist_ok=True)
+
+    img: Optional[Image.Image] = None
+
+    if ext in RAW_IMAGE_EXTS:
+        try:
+            import rawpy
+            with rawpy.imread(str(source_local)) as raw:
+                thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                img = Image.open(io.BytesIO(thumb.data))
+            else:
+                img = Image.fromarray(thumb.data)
+            img = ImageOps.exif_transpose(img).convert("RGB")
+        except Exception as e:
+            print(
+                f"Embedded RAW preview failed for {source_local}: {repr(e)}; "
+                "falling back to full decode",
+                flush=True,
+            )
+            img = None
+
+    if img is None:
+        img = read_image_any(source_local)
+
+    img.thumbnail((PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE), Image.Resampling.LANCZOS)
+    img.save(output_local, "JPEG", quality=PREVIEW_JPEG_QUALITY)
     return img.size
 
 
@@ -1238,6 +1290,156 @@ def compress_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> 
         "photos_per_second": round(len(rows) / max(0.001, time.time() - started), 3),
     }
     print("Compression result:", result, flush=True)
+    return result
+
+
+# ============================================================
+# WEB PREVIEWS (RAW / non-renderable formats)
+# ============================================================
+
+def preview_key_for_row(row: Dict[str, Any]) -> str:
+    album_slug = row["storage_album_slug"]
+    event_slug = row["storage_event_slug"]
+    photo_uuid = row.get("photo_uuid") or str(row["id"])
+    return f"albums/{album_slug}/events/{event_slug}/preview/{photo_uuid}.jpg"
+
+
+def row_needs_web_preview(row: Dict[str, Any]) -> bool:
+    if row.get("clean_preview_s3_key"):
+        return False
+    source_key = row.get("original_s3_key") or row.get("source_s3_key")
+    if not source_key:
+        return False
+    ext = Path(source_key).suffix.lower()
+    return ext not in WEB_RENDERABLE_EXTS
+
+
+def generate_one_preview(
+    row: Dict[str, Any],
+    photo_cols: Optional[set[str]] = None,
+) -> Tuple[str, str, Optional[str]]:
+    photo_id = str(row["id"])
+
+    try:
+        source_key = row.get("original_s3_key") or row.get("source_s3_key")
+        if not source_key:
+            raise RuntimeError("missing original/source S3 key")
+
+        preview_key = preview_key_for_row(row)
+        cols = photo_cols or table_columns("photos")
+
+        # Idempotent fast path: preview already in S3, just record the key.
+        if s3_key_exists(preview_key):
+            if "clean_preview_s3_key" in cols:
+                execute_sql(
+                    """
+                    UPDATE photos
+                    SET clean_preview_s3_key=%s, updated_at=now()
+                    WHERE id=%s::uuid;
+                    """,
+                    (preview_key, photo_id),
+                )
+            return "ok", photo_id, None
+
+        tmpdir = LOCAL_WORK / "preview" / photo_id
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(source_key).suffix or ".img"
+        original_local = tmpdir / f"original{suffix}"
+        preview_local = tmpdir / "preview.jpg"
+
+        download_file(source_key, original_local)
+        save_web_preview(original_local, preview_local)
+        upload_file(preview_local, preview_key, "image/jpeg")
+
+        if "clean_preview_s3_key" in cols:
+            execute_sql(
+                """
+                UPDATE photos
+                SET clean_preview_s3_key=%s, updated_at=now()
+                WHERE id=%s::uuid;
+                """,
+                (preview_key, photo_id),
+            )
+
+        return "ok", photo_id, None
+
+    except Exception as e:
+        return "failed", photo_id, repr(e)
+
+    finally:
+        try:
+            shutil.rmtree(LOCAL_WORK / "preview" / photo_id, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def generate_previews_for_events(album_ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    album_id = album_ctx["album_id"]
+    event_ids = [e["event_id"] for e in events]
+
+    rows = db_all("""
+        SELECT *
+        FROM photos
+        WHERE album_id=%s::uuid
+          AND album_event_id = ANY(%s::uuid[])
+          AND COALESCE(is_deleted,false)=false
+          AND clean_preview_s3_key IS NULL
+        ORDER BY created_at;
+    """, (album_id, event_ids))
+
+    rows = [r for r in rows if row_needs_web_preview(r)]
+
+    if not rows:
+        result = {"rows": 0, "ok": 0, "failed": 0, "errors": [], "workers": 0}
+        print("Web preview result:", result, flush=True)
+        return result
+
+    worker_count = max(1, min(COMPRESS_MAX_WORKERS, len(rows)))
+    photo_cols = table_columns("photos")
+
+    ok = 0
+    failed = 0
+    errors = []
+    started = time.time()
+
+    print(
+        f"Web preview start: rows={len(rows)}, workers={worker_count}",
+        flush=True,
+    )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(generate_one_preview, row, photo_cols) for row in rows]
+
+        for i, future in enumerate(as_completed(futures), start=1):
+            try:
+                status, photo_id, err = future.result()
+            except Exception as e:
+                status, photo_id, err = "failed", "unknown", repr(e)
+
+            if status == "ok":
+                ok += 1
+            else:
+                failed += 1
+                if len(errors) < 25:
+                    errors.append({"photo_id": photo_id, "error": err})
+
+            if COMPRESS_LOG_EVERY > 0 and (i % COMPRESS_LOG_EVERY == 0 or i == len(rows)):
+                elapsed = max(0.001, time.time() - started)
+                print(
+                    f"Web preview progress: {i}/{len(rows)} done, ok={ok}, failed={failed}, "
+                    f"rate={i / elapsed:.2f} photos/sec",
+                    flush=True,
+                )
+
+    result = {
+        "rows": len(rows),
+        "ok": ok,
+        "failed": failed,
+        "errors": errors[:25],
+        "workers": worker_count,
+        "seconds": round(time.time() - started, 2),
+    }
+    print("Web preview result:", result, flush=True)
     return result
 
 
@@ -2629,11 +2831,16 @@ def extract_json(text: str) -> Dict[str, Any]:
         return json.loads(repair_json(raw))
 
 
-def clamp_score(v: Any) -> int:
+def clamp_score(v: Any) -> Optional[int]:
+    if v is None or isinstance(v, bool):
+        return None
     try:
-        return max(0, min(10, int(round(float(v)))))
-    except Exception:
-        return 0
+        numeric = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return max(0, min(10, int(round(numeric))))
 
 
 def safe_int(v: Any) -> int:
@@ -2769,7 +2976,9 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
         occlusion_keywords = s(value.get("occlusion_keywords"), 500)
         search_phrases = str_list(value.get("search_phrases"), limit_each=120, max_items=10)
         photo_quality_score = clamp_score(value.get("photo_quality_score"))
-        personal_photo_quality_score = clamp_score(value.get("personal_photo_quality_score") or photo_quality_score)
+        personal_photo_quality_score = clamp_score(value.get("personal_photo_quality_score"))
+        if personal_photo_quality_score is None:
+            personal_photo_quality_score = photo_quality_score
         person_cover_score = clamp_score(value.get("person_cover_score"))
 
         normalized_people[label] = {
@@ -2806,7 +3015,7 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
                 f"face_visibility={face_visibility}",
                 f"body_visibility={body_visibility}",
                 f"camera_gaze={gaze}",
-                f"cover_score={person_cover_score}/10",
+                f"cover_score={person_cover_score}/10" if person_cover_score is not None else "cover_score=unknown",
                 f"search_phrases={', '.join(search_phrases)}",
             ])
         )
@@ -2826,6 +3035,11 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
                 "relationship_or_interaction": s(rel.get("relationship_or_interaction") or rel.get("interaction"), 300) or "uncertain",
             })
 
+    background_quality_text = f"{background_quality}/10" if background_quality is not None else "unknown"
+    frame_clarity_text = f"{frame_clarity}/10" if frame_clarity is not None else "unknown"
+    album_worthy_text = f"{album_worthy_score}/10" if album_worthy_score is not None else "unknown"
+    print_worthy_text = f"{print_worthy_score}/10" if print_worthy_score is not None else "unknown"
+
     quality_keywords = (
         f"event_type={event_type_guess}; "
         f"photo_style={photo_style}; "
@@ -2843,11 +3057,11 @@ def normalize_qwen_data(data: Dict[str, Any]) -> Dict[str, Any]:
         f"technical_issues={', '.join(technical_issues)}; "
         f"decoration_present={decoration_present}; "
         f"decoration={decoration_keywords}; "
-        f"background_quality={background_quality}/10; "
-        f"frame_clarity={frame_clarity}/10; "
+        f"background_quality={background_quality_text}; "
+        f"frame_clarity={frame_clarity_text}; "
         f"camera_gaze={gaze_overall}; "
-        f"album_worthy_score={album_worthy_score}/10; "
-        f"print_worthy_score={print_worthy_score}/10; "
+        f"album_worthy_score={album_worthy_text}; "
+        f"print_worthy_score={print_worthy_text}; "
         f"duplicate_risk={duplicate_risk}; "
         f"best_use={best_use}; "
         f"album_worthy_reason={album_worthy_reason}"
@@ -3270,10 +3484,15 @@ def save_qwen_photo(
                     body_visibility = person_data.get("body_visibility", "uncertain")
                     gaze = person_data.get("camera_gaze", "uncertain")
                     occlusion_keywords = person_data.get("occlusion_keywords", "")
-                    quality_score = person_data.get("photo_quality_score", 0)
-                    personal_quality_score = person_data.get("personal_photo_quality_score", quality_score)
-                    person_cover_score = person_data.get("person_cover_score", 0)
+                    quality_score = person_data.get("photo_quality_score")
+                    personal_quality_score = person_data.get("personal_photo_quality_score")
+                    if personal_quality_score is None:
+                        personal_quality_score = quality_score
+                    person_cover_score = person_data.get("person_cover_score")
                     search_phrases = person_data.get("search_phrases", [])
+
+                    def persisted_score_text(score: Optional[int]) -> str:
+                        return "unknown" if score is None else f"{score}/10"
 
                     person_search_text = (
                         f"{label}; "
@@ -3290,9 +3509,9 @@ def save_qwen_photo(
                         f"body_visibility={body_visibility}; "
                         f"camera_gaze={gaze}; "
                         f"occlusion={occlusion_keywords}; "
-                        f"photo_quality_score={quality_score}/10; "
-                        f"personal_photo_quality_score={personal_quality_score}/10; "
-                        f"person_cover_score={person_cover_score}/10; "
+                        f"photo_quality_score={persisted_score_text(quality_score)}; "
+                        f"personal_photo_quality_score={persisted_score_text(personal_quality_score)}; "
+                        f"person_cover_score={persisted_score_text(person_cover_score)}; "
                         f"search_phrases={search_phrases}"
                     )[:4000]
 
@@ -3753,10 +3972,8 @@ def get_qwen_quality(qwen_json: Any) -> Dict[str, Any]:
 
 
 def score01_from_10(v: Any, default: float = 0.0) -> float:
-    try:
-        return max(0.0, min(1.0, float(v) / 10.0))
-    except Exception:
-        return default
+    score = clamp_score(v)
+    return default if score is None else score / 10.0
 
 
 def compute_cv_quality(local_path: Path) -> Dict[str, float]:
@@ -3858,9 +4075,19 @@ def upsert_photo_culling_score(photo: Dict[str, Any], payload: Dict[str, Any]) -
         # Your current face_quality_score is det_score * face_side, so normalize loosely.
         face_quality = max(0.0, min(1.0, raw_face_quality / 500.0))
 
-        qwen_aesthetic = score01_from_10(quality.get("album_worthy_score"), 0.0)
-        composition = score01_from_10(quality.get("background_quality"), 0.5)
-        frame_clarity = score01_from_10(quality.get("frame_clarity"), cvq["sharpness_score"])
+        album_worthy_score = clamp_score(quality.get("album_worthy_score"))
+        background_quality = clamp_score(quality.get("background_quality"))
+        frame_clarity_score = clamp_score(quality.get("frame_clarity"))
+        ai_signal_availability = {
+            "album_worthy_score": album_worthy_score is not None,
+            "background_quality": background_quality is not None,
+            "frame_clarity": frame_clarity_score is not None,
+        }
+        missing_ai_signals = [name for name, available in ai_signal_availability.items() if not available]
+
+        qwen_aesthetic = score01_from_10(album_worthy_score, 0.5)
+        composition = score01_from_10(background_quality, 0.5)
+        frame_clarity = score01_from_10(frame_clarity_score, cvq["sharpness_score"])
 
         gaze = str(quality.get("camera_gaze_overall") or "uncertain").lower()
         gaze_score = 1.0 if gaze == "all" else 0.65 if gaze == "some" else 0.35 if gaze == "none" else 0.5
@@ -3902,9 +4129,9 @@ def upsert_photo_culling_score(photo: Dict[str, Any], payload: Dict[str, Any]) -
             reasons.append("sharp image")
         if gaze_score >= 0.9:
             reasons.append("subjects looking at camera")
-        if qwen_aesthetic >= 0.8:
+        if ai_signal_availability["album_worthy_score"] and qwen_aesthetic >= 0.8:
             reasons.append("high album-worthy AI score")
-        if composition >= 0.75:
+        if ai_signal_availability["background_quality"] and composition >= 0.75:
             reasons.append("good background/composition")
         if not reasons:
             reasons.append("balanced technical and AI quality score")
@@ -3915,6 +4142,9 @@ def upsert_photo_culling_score(photo: Dict[str, Any], payload: Dict[str, Any]) -
             "face_count": face_count,
             "raw_face_quality": raw_face_quality,
             "gaze": gaze,
+            "missing_ai_signals": missing_ai_signals,
+            "ai_signal_availability": ai_signal_availability,
+            "aesthetic_available": ai_signal_availability["album_worthy_score"],
         }
 
         execute_sql("""
@@ -4664,6 +4894,10 @@ def normalize_steps(payload: Dict[str, Any]) -> Dict[str, bool]:
         "crop_person_covers": bool(full_mode),
         "enqueue_qwen": bool(full_mode),
 
+        # Generate browser-renderable previews for RAW/non-web formats so they
+        # show in the gallery right after ingest, before full compression.
+        "generate_previews": True,
+
         # Keep old/other pipeline steps present but off in face-worker.
         "rebuild_people": False,
         "qwen": False,
@@ -4736,6 +4970,19 @@ def process_album_events(job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             "Validating S3 source objects",
         )
         results["steps"]["s3_validation"] = validate_s3_sources(album_ctx, db_events)
+
+        # 1b. Generate browser-renderable previews for RAW/non-web formats so
+        # they are visible right after ingest, before full compression runs.
+        if steps.get("generate_previews", True):
+            update_job_status(
+                job_id,
+                "running",
+                "generate_previews",
+                "Generating web previews for RAW/non-renderable photos",
+            )
+            results["steps"]["generate_previews"] = generate_previews_for_events(
+                album_ctx, db_events
+            )
 
     # 2. Generate AI input images.
     if steps.get("compress", False):
